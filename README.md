@@ -124,11 +124,14 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
 ### What you need
 
 - **The game:** *LoZ OOT* for NS2, version 1.1.1 (title `0400486024DEC000`,
-  v131072), dumped by yourself as a `.nup` file. The builder checks it against this dump:
-  - size: 25,020,741,061 bytes
-  - SHA-256: `5a23bbbb382193020eb7235ea21c368bfd8473e7795d24e17a487f43380ce74c`
+  v131072), dumped by yourself as a `.nup` file. Before building, the builder checks:
+  - the title and update inside the `.nup`;
+  - every file the build reads, against the SHA-256 the `.nup` itself holds for it;
+  - the game's program after extraction, against the known 1.1.1 hashes (`main` starts `2591fb99`).
 
-  Other versions or dumps are not supported (`--skip-hash-check` builds anyway, at your own risk).
+  Other versions are not supported (`--skip-hash-check` builds anyway, at your own risk). If the builder reports
+  re-reads, or a file fails its hash only now and then, the PC's memory is returning wrong bytes: test it (MemTest86) and
+  turn off memory overclocking (XMP/EXPO) before trusting a build.
 - **The console:** a **base PS5** (disc or digital) on a jailbroken firmware with a homebrew environment (kstuff,
   elfldr, ShadowMountPlus) and an FTP server (ftpsrv). The Pro has more memory and native mesh shaders; this port does
   not target it. FALLBACK MESH SHADERS AS COMPUTE SHADERS ARE USED HERE.
@@ -307,7 +310,7 @@ Built for this port, for the base PS5. Each has a switch to turn it off. They ar
 
 - `build.sh` and the bundled `deps/`. A self-contained clang/lld 18, Python 3.12 with the build's packages, and every
   PS5 library prebuilt, so a build needs nothing from the PC but bash and coreutils.
-- It checks the game file's size and SHA-256 and lifts the game with Longshot's hot list. It makes the shader list and
+- It checks the game file (title, update and the hash of every file it reads) and lifts the game with Longshot's hot list. It makes the shader list and
   the PS5 button prompts from the game's own files, builds with the console profile and ThinLTO, and lays out the title
   with the shipped settings and mods.
 - Checked against the development build: from the same `.nup`, the builder produces identical game code, an identical
