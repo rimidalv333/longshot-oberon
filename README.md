@@ -117,7 +117,9 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
   Locked 30 also allows a smoother 2x for 60 via framegen.
 
 **Known issues**
-- Building wall that lit up as you came close is FIXED by capping the local-light list (`RX_VK_LIGHT_CAP=64`) - sun is unaffected.
+- The building wall that lit up as you came close (Kakariko) no longer shows with the current build, with the local-light cap
+  off (`RX_VK_LIGHT_CAP=0`, the shipped value). Leave it at 0: any other value, even 64, makes some light reflections (water)
+  flash in longer sessions.
 - One game-code crash was seen once, in a diagnostic experiment that ran the game at 9 fps. It has not been seen in normal play.
 - The first start translates every shader (several hours, once). See [First start](#first-start).
 - Slight hitches can occur during sudden camera  turns (180deg.) but only when facing a very busy area (a lot of draws)
@@ -240,7 +242,7 @@ Two text files beside `eboot.bin` hold the settings. Edit them on the console ov
 | `RX_VK_READBACK_LATE=newest` | The game's reads of GPU results don't wait for the newest frame: 4.2 → 0.8 ms of waiting a frame |
 | `RX_VK_OCC_QUERIES=0` | No occlusion queries: heavy scenes 22.9 → 28–29 fps, about 200 MB more textures |
 | `RX_VK_UPLOAD_BUDGET_MS=20` | Spreads texture uploads over frames: frames with uploads over 40 ms 16 → 3 |
-| `RX_VK_LIGHT_CAP=64` | The local-light cap (see [Known issues](#status-and-performance)) |
+| `RX_VK_LIGHT_CAP=0` | The local-light cap, off (keep it at 0: any other value makes water reflections flash in long sessions; see [Known issues](#status-and-performance)) |
 | `RX_VK_UP_SHARPEN=15` | Sharpening of the 3D before the HUD, 0–100 |
 | `RX_VK_FRAMEGEN=1` | Frame generation (PS5_MihawkGen) to 60 shown, off by default |
 
@@ -355,7 +357,7 @@ Each change was TESTED AND FIXED on its own, with a backup and an off switch, an
 | White world frames | Single white frames, worst in the market | An experimental second read of the game's render conditions | That experiment switched off for good |
 | Temple of Time light rays flashing | The rays flickered | An exposure-meter reading that came back zero reused a stale result | That hold switched off |
 | GPU hang on lit draws | Freeze, then the title killed: the Kakariko gate route and the night market's pine tree | RADV's NGG geometry path on GC 10.1.3 | NGG off. Ruled out on the way, one run each: resolution, the breakable crates, cold store, VRAM compaction, texture eviction, the light-list loop, memory, occlusion queries, draw state, vertex data, any single program, shader loops, primitive binning |
-| A wall lighting up as you approach | One building lit far too bright | The lit shaders' local-light list held up to ~24,000 lights a cell | `RX_VK_LIGHT_CAP` |
+| A wall lighting up as you approach | One building lit far too bright | The lit shaders' local-light list held up to ~24,000 lights a cell | First held by `RX_VK_LIGHT_CAP`, which made water flash in long sessions; no longer seen with the later fixes, the cap off (`0`) |
 | Camera-turn hitches | 30–100 ms frames when turning | Hundreds of textures uploaded in one frame | Layer-batched uploads, ASTC read in place (2.6 GB not copied a session), the upload budget, the ASTC decoder with LDS scratch |
 | Unpause hitch | A stall after the inventory | Textures evicted as "unused" during the pause | Pause frames don't age textures |
 | Docked 1080p in the market | Two memory emergencies | 130–450 MB more for the renderer at 1080p | Ships in the handheld profile at 1080p output; 1440p tested too (another ~500 MB) |

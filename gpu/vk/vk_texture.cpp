@@ -83,6 +83,7 @@ extern "C" int hos_ps5_unit_data(uintptr_t addr);
 #ifdef __PROSPERO__
 extern "C" uint64_t hos_ps5_direct_room(void);   // (host/ps5/win32_ps5.c: the title's free direct memory in all)
 extern "C" int hos_ps5_mem_emergency(void);     // (host/ps5/win32_ps5.c: the memory guard's emergency)
+extern "C" int hos_oot_menu_open(void);         // (host/oot_menu.c, MN1: the game's pause or panel menu is up)
 #endif
 
 namespace mkwvk {
@@ -5334,7 +5335,24 @@ void texture_frame(uint64_t completed) {
         draw_stats(&now_d, &skipped_, &dispatches_, &pipes_);   // (vk_draw.cpp: every draw recorded so far)
         const int64_t dd = now_d - l_draws;
         l_draws = now_d;
-        if (!age_always && dd >= 0 && dd < quiet_draws) {
+        // (MN1, 2026-11-24: the menu-close hitch) The game's pause and panel menus (items, equipment, map, quest log) cover the
+        // screen and the game draws no world behind them, but the item page's 3D Link takes them to 300-500 draws, past the
+        // draw-count rule, and RX_VK_EVICT_PAUSE_AGE=1 (in the shipped env since 11-21) turns that rule off. newest-logs/4.log:
+        // "641 textures retired ... budget 632" as the menu opened, then on its close a 52 ms upload frame, 218 textures left for
+        // later frames and more upload frames. Here a present while those screens update (host/oot_menu.c, the same hook as
+        // Sprint's) is a quiet one whatever the draws or that switch. The memory guard's paths still go by real frames.
+        // RX_VK_EVICT_MENU_AGE=1: menu frames age the textures, as before
+        static const bool menu_age = env_on("RX_VK_EVICT_MENU_AGE");
+        static uint64_t menu_run = 0, menu_logged = 0;
+        const bool in_menu = !menu_age && hos_oot_menu_open();
+        if (in_menu) menu_run++;
+        else {
+            if (menu_run >= 30 && menu_logged++ < 50)
+                logf("vk: %llu presents in the game's pause or panel menu did not age the textures (RX_VK_EVICT_MENU_AGE=1: they did)",
+                     (unsigned long long)menu_run);
+            menu_run = 0;
+        }
+        if (in_menu || (!age_always && dd >= 0 && dd < quiet_draws)) {
             quiet_total++, quiet_run++;
         } else {
             if (quiet_run >= 300 && quiet_logged++ < 50)

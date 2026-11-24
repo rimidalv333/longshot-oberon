@@ -55,5 +55,10 @@ RX_VK_OCC_QUERIES=0
 #RX_VK_FRAMEGEN=1
 #RX_VK_MIHAWKGEN=0
 
-RX_VK_LIGHT_CAP=64
+RX_VK_LIGHT_CAP=0
 RX_VK_RECORDER=thread
+
+# Sprint on L3 (the game's own fast run): on by default. HOS_SPRINT=0: off, L3 is the game's LS again.
+# HOS_SPRINT_TOGGLE=0: sprint only while L3 is held (default: a press starts it, Link stopping or the next press ends it).
+#HOS_SPRINT=0
+#HOS_SPRINT_TOGGLE=0

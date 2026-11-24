@@ -26,6 +26,10 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
   GameDataMgr whether the option was written (f_80a9d1c0) and applies it only then; option.sav's value replaces the
   option without a write, so a saved choice was never applied (issue 430). The call goes through hos_oot_voice_option,
   which also says yes when the option's value is not the one of the update before. The supported build only.
+- Sprint (host/oot_sprint.c; Longshot #2038, ported 2026-11-24): two places load Link's input flags, whose bit 4 is the dash
+  input, the game's own run after a roll: his movement update (f_804caa80, at 0x804ce798, for the sprint's start and keep tests)
+  and his stance and camera update (f_80c225d0, at 0x80c27f3c). A call right after each load (hos_sprint_link,
+  hos_sprint_stance) ORs the bit in while Sprint runs. A and the game's buttons are left alone.
 - Ocarina note controls: the note-wait action's start (f_828a9190) and tick (f_828a9280) report the wait to the host (hos_oc_wait, hos_oc_beat), which swaps the five notes for its own controls (host/nn_hid.c); a tick whose gates refuse reports no wait, so a dialogue keeps its buttons.
 - (longshot #1814, c88f7044) The neighbouring map the OptimizeChangeBank thread preloads, kept while the game's choice only
   flickers (host/oot_ocb_hold.h): the preload manager's update (f_832b9880) picks one of the map's neighbours each frame and
@@ -1137,6 +1141,58 @@ def patch_ocarina_wait(s):
     return s
 
 
+# Sprint (host/oot_sprint.c; Longshot #2038, ported 2026-11-24): two places load Link's input flags, whose bit 4 is the dash
+# input that makes him sprint. Link's movement update, f_804caa80, loads them into x10 at 0x804ce798 for the sprint's start and
+# keep tests; the stance and camera update, f_80c225d0, loads their low byte into x8 at 0x80c27f3c. Link is in x19 at both. A
+# call right after each load ORs the bit in while Sprint runs. (Not behind protect_hearts here, unlike upstream: build.sh's
+# second run over a lift made before has them too. The anchors are 1.1.1's exact code, so another build is left alone.)
+SPRINT_LINK_HEAD = "void f_804caa80(Ctx *__restrict A64_NOESC c) {\n"
+# Match the loads and their surrounding landmarks as patterns, not excerpts from lifted game code.
+# The named group ends at the instruction whose result the host hook changes.
+_SPRINT_LOAD = r"c->x\[%d\]\s*=\s*recomp_load%d\(c,\s*c->x\[%d\]\s*\+\s*%d\);\s*"
+SPRINT_LINK_AT = (r"L_804ce790:;\s*" + _SPRINT_LOAD % (10, 64, 19, 80) +
+                  _SPRINT_LOAD % (9, 32, 19, 44) +
+                  r"(?P<site>" + _SPRINT_LOAD % (10, 64, 10, 0) + r")")
+SPRINT_LINK_CALL = "    hos_sprint_link(c);   /* (nx2/oot_patches.py: Sprint) */\n"
+SPRINT_STANCE_HEAD = "void f_80c225d0(Ctx *__restrict A64_NOESC c) {\n"
+SPRINT_STANCE_AT = (_SPRINT_LOAD % (8, 64, 19, 80) +
+                    r"(?P<site>" + _SPRINT_LOAD % (8, 8, 8, 0) + r")" +
+                    r"if\s*\(\(\(c->x\[8\]\s*>>\s*4\)\s*&\s*1\)\)\s*\{\s*goto\s+L_80c27f54;\s*\}")
+SPRINT_STANCE_CALL = "    hos_sprint_stance(c);   /* (nx2/oot_patches.py: Sprint) */\n"
+SPRINT_DECL = "extern void hos_sprint_link(Ctx *c);\nextern void hos_sprint_stance(Ctx *c);\n"
+
+
+def _sprint_hook(source, head, pattern, call):
+    """Put call after the unique matching site in the function, or leave differing code alone."""
+    start = source.find(head)
+    if start < 0:
+        return source, 0
+    end = source.find("\nvoid f_", start + len(head))
+    end = end if end >= 0 else len(source)
+    body = source[start:end]
+    if call in body:
+        return source, 1
+    matches = list(re.finditer(pattern, body))
+    if len(matches) != 1:
+        return source, 0
+    at = matches[0].end("site")
+    body = body[:at] + call + body[at:]
+    source = source[:start] + body + source[end:]
+    if SPRINT_DECL not in source:
+        source = source.replace('#include "a64.h"\n', '#include "a64.h"\n' + SPRINT_DECL, 1)
+    return source, 1
+
+
+def patch_sprint_link(source):
+    """f_804caa80 calls hos_sprint_link right after it loads Link's input flags into x10 (0x804ce798): (source, found)"""
+    return _sprint_hook(source, SPRINT_LINK_HEAD, SPRINT_LINK_AT, SPRINT_LINK_CALL)
+
+
+def patch_sprint_stance(source):
+    """f_80c225d0 calls hos_sprint_stance right after it loads the flags' low byte into x8 (0x80c27f3c): (source, found)"""
+    return _sprint_hook(source, SPRINT_STANCE_HEAD, SPRINT_STANCE_AT, SPRINT_STANCE_CALL)
+
+
 def patch_file(s, name, protect_hearts=False):
     """One lifted file's patches (apply(), and nx2/chunks.py edit_c, a process per file): (its text, the places counted in it, the
     lines to print). The counts add up over the files; report() decides from the sums"""
@@ -1204,6 +1260,12 @@ def patch_file(s, name, protect_hearts=False):
         if ocw != out:
             lines.append("oot_patches: the ocarina note wait in " + name)
         out = ocw
+    for what, patch in (("sprint link", patch_sprint_link), ("sprint stance", patch_sprint_stance)):
+        sprint, n = patch(out)
+        counts[what] += n
+        if sprint != out:
+            lines.append("oot_patches: Sprint's %s site in %s" % (what.split()[1], name))
+        out = sprint
     out, n = fixed_scale(out)
     if n:
         counts["fixed path's scale"] += 1
@@ -1374,6 +1436,9 @@ def report(paths, counts, protect_hearts=False):
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))
     if protect_hearts and speed_hooks != len(SPEED_PLACES):
         print("oot_patches: WARNING: the movement speed's places were found %d times, not %d" % (speed_hooks, len(SPEED_PLACES)))
+    if (total["sprint link"], total["sprint stance"]) != (1, 1):   # (without them Sprint does nothing: host/oot_sprint.c)
+        print("oot_patches: WARNING: Sprint's sites were found %d and %d times of 1 each (movement, stance): Sprint does "
+              "nothing" % (total["sprint link"], total["sprint stance"]))
     if protect_hearts and total["opening skip"] != 3:
         print("oot_patches: WARNING: the opening skip was found at %d of 3 functions" % total["opening skip"])
     if protect_hearts and camera_speed != len(CAMERA_SPEED_HEADS):

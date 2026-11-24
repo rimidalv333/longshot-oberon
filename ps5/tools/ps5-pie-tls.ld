@@ -80,6 +80,14 @@ SECTIONS {
     .tdata : ALIGN(32) { *(.tdata .tdata.* .gnu.linkonce.td.*) } : data : tls
     .tbss : ALIGN(32) { *(.tbss .tbss.* .gnu.linkonce.tb.*) *(.tcommon) } : data : tls
     .data : { *(.data .data.*) } : data
+    /* (PS5_VK_PGO=gen only, 2026-11-24: absent and dropped in every other build) The profile's counters and records are
+       writable and not relro: placed by lld as orphans after .got.plt, inside the relro segment, they made the converter
+       (sce_module_writer.cpp) take the data segment to start there, before the relro data's end ("LLVM layout leaves no room
+       for PS5 process parameters"). Here they are data, stored with it, and keep the names lld makes __start_/__stop_ for. */
+    __llvm_prf_cnts : { *(__llvm_prf_cnts) } : data
+    __llvm_prf_data : { *(__llvm_prf_data) } : data
+    __llvm_prf_bits : { *(__llvm_prf_bits) } : data
+    __llvm_prf_vnds : { *(__llvm_prf_vnds) } : data
     .bss : {
         *(.bss .bss.*)
         *(COMMON)

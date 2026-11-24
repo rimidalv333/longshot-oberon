@@ -728,6 +728,26 @@ void hos_filter_stick(int16_t x, int16_t y, int zone, int32_t out[2]) {
 static volatile int xinput_pads_now;   /* (pads_read: the controllers XInput has, while it is polled) */
 int hos_xinput_pads(void) { return xinput_pads_now; }   /* (host/prompts.c: Auto's face) */
 
+/* ---- Sprint (host/oot_sprint.c; Longshot #1929-#2168, ported 2026-11-24 for the PS5, which has no Controls tab): L3 is
+   Sprint's, the game's own fast run (the dash input), not the game's LS. HOS_SPRINT=0: off, L3 is LS again as before.
+   HOS_SPRINT_TOGGLE=0: Link sprints while L3 is held; on (the default, as upstream): a press starts it, the next press or
+   Link's state ends it (he stops, attacks, targets, talks...). A press of L3 that begins outside gameplay (a conversation,
+   where LS hides the text box) is handed to the game as LS for as long as it is held, and starts no sprint ---- */
+static int sprint_setting(int toggle) {
+    static int on = -1, tog = -1;
+    if (on < 0) {
+        const char *v = getenv("HOS_SPRINT"), *t = getenv("HOS_SPRINT_TOGGLE");
+        tog = !(t && t[0] == '0'), on = !(v && v[0] == '0');
+        hos_log("input: Sprint %s%s", on ? "on L3" : "off (HOS_SPRINT=0): L3 is the game's LS",
+                on ? (tog ? ", a press starts it and the next or Link's state ends it (HOS_SPRINT_TOGGLE=0: while held)"
+                          : ", while held (HOS_SPRINT_TOGGLE=0)") : "");
+    }
+    return toggle ? tog : on;
+}
+static volatile int sprint_pad_down;   /* (pads_read: L3 held at the last read of the pads, Sprint on) */
+uint64_t hos_sprint_input(uint64_t buttons, int on, int down, int l3, int toggle, int reset, int blocked);
+enum { SPRINT_BLOCKED = 1, SPRINT_AWAY = 2, SPRINT_PAUSE = 4 };   /* (its blocked: host/oot_sprint.c's) */
+
 static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     static int64_t next_read, retry[XUSER_MAX_COUNT];
     static int was_connected[XUSER_MAX_COUNT];
@@ -819,7 +839,10 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     const uint64_t chord = 1ULL << HOS_PAD_BACK | 1ULL << HOS_PAD_START;
     if ((raw & chord) == chord) raw &= ~chord;
     pad_raw_game = raw;
-    const uint64_t b = bound_pad_buttons(raw);
+    /* (Sprint: L3 is Sprint's, not bound to the game's LS; npad_states hands it to host/oot_sprint.c) */
+    const int sprint = sprint_setting(0);
+    __atomic_store_n(&sprint_pad_down, sprint && (raw >> HOS_PAD_LSTICK & 1), __ATOMIC_RELAXED);
+    const uint64_t b = bound_pad_buttons(sprint ? raw & ~(1ULL << HOS_PAD_LSTICK) : raw);
     cached_buttons = b;
     memcpy(cached_stick, s, sizeof s);
     *buttons |= b;
@@ -1189,6 +1212,16 @@ static void npad_states(Ctx *c) {
         }
         __atomic_store_n(&flight_input, flight, __ATOMIC_RELAXED);
         __atomic_store_n(&move_stick_held, abs(stick[0]) > 4096 || abs(stick[1]) > 4096, __ATOMIC_RELAXED);
+        {   /* Sprint (above sprint_setting): host/oot_sprint.c, from each read of the controllers. away: the player's input
+               does not reach the game (the Insert menu open, the focus lost with no pads behind other windows), which holds
+               a toggled sprint as it is; blocked: the Insert menu, or the ocarina waiting for a note; pause: Plus or Minus */
+            const int on = sprint_setting(0), toggle = on && sprint_setting(1);
+            const int away = menu_open || (!game_in_front() && !pads_in_background(getenv("HOS_INPUT_BACKGROUND"), rx_option(4, 0)));
+            const int blocked = (menu_open || hos_oc_wait == 1 ? SPRINT_BLOCKED : 0) | (toggle && away ? SPRINT_AWAY : 0) |
+                                (pause ? SPRINT_PAUSE : 0);
+            buttons = hos_sprint_input(buttons, on, on && __atomic_load_n(&sprint_pad_down, __ATOMIC_RELAXED), 1, toggle, 0,
+                                       blocked);
+        }
         __atomic_store_n(&free_camera_axes, axes, __ATOMIC_RELAXED);
         __atomic_store_n(&free_camera_height, height, __ATOMIC_RELAXED);
     }

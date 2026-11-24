@@ -13,6 +13,30 @@
    and hands it to the focus manager (*(screen+32)+96, its vtable +48), when the manager takes the player's input.
    HOS_MENU_TRACE=1: the focus changes, the screens and what the mouse does logged. */
 #include "hos.h"
+
+/* (Longshot #2168, ported 2026-11-24: host/oot_sprint.c) Screen updates are the game's menu signal. Consume it at Link's
+   update so the first update after the screens stop releases the sprint even when Link remains stationary. The panel
+   frame runs on all three panel pages and in pause. */
+static volatile int sprint_menu_seen;
+int hos_oot_menu_sprint_active(void) {
+    return __atomic_exchange_n(&sprint_menu_seen, 0, __ATOMIC_RELAXED);
+}
+/* (MN1, 2026-11-24) When the pause or panel screens last updated (hos_now_ns), for the renderer: while they are up the game
+   draws no world behind them, and its textures must not age out of the budget (gpu/vk/vk_texture.cpp, play_age) */
+static volatile int64_t menu_seen_ns;
+int hos_oot_menu_open(void) {   /* 1: the pause or panel menu updated within the last 250 ms */
+    const int64_t t = __atomic_load_n(&menu_seen_ns, __ATOMIC_RELAXED);
+    return t && hos_now_ns() - t < 250000000LL;
+}
+static void sprint_menu_tick(uint64_t screen) {
+    if (!screen || !hos_mem_region(screen, 8)) return;
+    const uint64_t vt = G64(screen);
+    if (vt == g_module_base + 0x84c0baa8ULL || vt == g_module_base + 0x84c08aa0ULL ||
+        vt == g_module_base + 0x84c07798ULL || vt == g_module_base + 0x84c04a18ULL) {
+        __atomic_store_n(&sprint_menu_seen, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&menu_seen_ns, hos_now_ns(), __ATOMIC_RELAXED);
+    }
+}
 #ifndef LONGSHOT_ENV_H   /* (env_on: the switches' one rule) */
 #include "../gpu/vk/compat/longshot_env.h"
 #endif
@@ -765,6 +789,7 @@ static Seen *screen_seen(uint64_t screen, int64_t now) {
 
 void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     if (!screen) return;
+    sprint_menu_tick(screen);
     if (trace < 0) trace = env_on("HOS_MENU_TRACE");
     const int64_t now = hos_now_ns();
     AcquireSRWLockExclusive(&seen_lock);
@@ -826,5 +851,5 @@ void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr) {
     (void)c, (void)screen, (void)pane, (void)lr;
     hos_input_clear_toggles();
 }
-void hos_oot_menu_tick(Ctx *c, uint64_t screen) { (void)c, (void)screen; }
+void hos_oot_menu_tick(Ctx *c, uint64_t screen) { (void)c; sprint_menu_tick(screen); }
 #endif

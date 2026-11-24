@@ -18,7 +18,7 @@
 set -euo pipefail
 
 TITLE_ID=PPSA93339
-VERSION=1.0.0
+VERSION=1.1.0
 # (the game's program as the build lifts it, decompressed: the same from any good dump of 1.1.1)
 EXEFS_SHA256="2591fb99008d0814f8056c3f36b36790048ed857ff0ae2bb3a4c1e37b960a4de  main
 94c154d83cbaca00d092958cc2b3a0494d7308fe49de8cb33ece7e9e67303ea7  main.npdm
