@@ -108,6 +108,9 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
 - **Picture:** the game's handheld profile (3D at 1536×864) with AMD FSR 3.1 as anti-aliasing, sharpened before the HUD
   and shown at 1920×1080. Docked 1080p works too, but costs 130–450 MB more memory and doesn't raise the frame rate; it
   ran short of memory in the market (this doesn't mean it crashed - it only triggered a downgrade of some textures as fallback).
+- **Unlocked:** unlocked framerate is an option and some closed-off areas or legacy dungeons can hit 50-60FPS without framegen,
+  however locked 30 with some overhead in case of hitches is a better experience in my subjective opinion.
+  Locked 30 also allows a smoother 2x for 60 via framegen.
 
 **Known issues**
 - Building wall that lit up as you came close is FIXED by capping the local-light list (`RX_VK_LIGHT_CAP=64`) - sun is unaffected.
