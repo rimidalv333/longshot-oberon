@@ -35,6 +35,8 @@
 </table>
 
 ---
+> [!CAUTION]
+> Not playtested after getting Zelda's Letter, if any crashes occur I will try to update with each release.
 
 ## Introduction
 
