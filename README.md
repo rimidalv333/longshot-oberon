@@ -227,30 +227,59 @@ follow your button bindings.
 
 Two text files beside `eboot.bin` hold the settings. Edit them on the console over FTP.
 
-- **`longshot_options.ini`**: the in-game menu's options (resolution, upscaler, FOV, controls, button prompts…). The
-  shipped one is the tested setup: FSR 3.1 (`dlss=3`) with the Lanczos output filter, handheld profile, field of view 100,
-  PS5 prompts, anisotropic filtering 4×, console-level shadows (`memory_budget=1`).
-- **`longshot_env.txt`**: the engine switches, `NAME=value` per line, `#` for comments. The shipped file is the tested
-  baseline. The most useful lines:
+- **`longshot_options.ini`**: the in-game menu's options (upscaler, FOV, controls, button prompts…). The shipped one is the
+  tested setup: FSR 3.1 (`dlss=3`) with the Lanczos output filter, field of view 100, PS5 prompts, anisotropic filtering 4×,
+  console-level shadows (`memory_budget=1`). The resolution and the handheld/docked profile are set by `longshot_env.txt`,
+  which wins over the ini.
+- **`longshot_env.txt`**: the engine switches, `NAME=value` per line, `#` for comments.
+
+### Premade profiles
+
+The easiest way to set up `longshot_env.txt` is to pick one of the ready-made profiles in
+**[PREMADE-PROFILES](PREMADE-PROFILES/)**: download it, rename it to `longshot_env.txt` and copy it into
+`/data/homebrew/PPSA93339/`, replacing the old one (the builder never overwrites an existing `longshot_env.txt`). All of them
+share the same tested memory and performance settings; they differ only in resolution, the frame-rate lock and frame
+generation.
+
+| Profile | Handheld / docked | Game output → TV | 3D drawn at | FSR 3.1 | Frame rate |
+|---|---|---|---|---|---|
+| [`1-SAFE-handheld-30`](PREMADE-PROFILES/1-SAFE-handheld-30.txt) | Handheld | 1080p | 1536×864 | Anti-aliasing | Locked 30 |
+| [`2-docked-1080p-30`](PREMADE-PROFILES/2-docked-1080p-30.txt) | Docked | 1080p → 1080p | 1920×1080 | Anti-aliasing | Locked 30 |
+| [`3-docked-1080p-60-framegen`](PREMADE-PROFILES/3-docked-1080p-60-framegen.txt) | Docked | 1080p → 1080p | 1920×1080 | Anti-aliasing | Locked 30, 60 shown with frame generation |
+| [`4-docked-1440p-fsr-upscaled-30`](PREMADE-PROFILES/4-docked-1440p-fsr-upscaled-30.txt) | Docked | 1440p → 1440p | 1920×1080 | Upscaling to 1440p | Locked 30 |
+| [`5-docked-1440p-fsr-upscaled-60-framegen`](PREMADE-PROFILES/5-docked-1440p-fsr-upscaled-60-framegen.txt) | Docked | 1440p → 1440p | 1920×1080 | Upscaling to 1440p | Locked 30, 60 shown with frame generation |
+| [`6-POTATO-test-unlocked-target60`](PREMADE-PROFILES/6-POTATO-test-unlocked-target60.txt) | Handheld | 1080p | 1152×648 | Upscaling to 1536×864 | Unlocked, aiming at a native 60 |
+| [`RISKY-docked-1440p-native-30`](PREMADE-PROFILES/RISKY-docked-1440p-native-30.txt) | Docked | 1440p → 1440p | 2560×1440 | Anti-aliasing | Locked 30 |
+| [`VERY-RISKY-docked-1440p-native-60-framegen`](PREMADE-PROFILES/VERY-RISKY-docked-1440p-native-60-framegen.txt) | Docked | 1440p → 1440p | 2560×1440 | Anti-aliasing | Locked 30, 60 shown with frame generation |
+
+- **SAFE** is the setup this port is tested with: the game's handheld profile, its last step to the 1080p screen done by the
+  Lanczos filter. The docked profiles draw more and look sharper on a TV, and use more memory (about 130-450 MB at 1080p).
+- **FSR 3.1 runs in every profile.** Where the 3D is drawn at the output's size it is the game's anti-aliasing; where it is
+  drawn smaller, FSR 3.1 also upscales it, rebuilding detail from several frames: the FSR-upscaled 1440p profiles look
+  between 1080p and native 1440p, with a native 1440p HUD.
+- **RISKY / VERY-RISKY** draw the 3D at a true 2560×1440. In testing that used about 500 MB more memory and ran short in
+  Castle Town: expect blurry textures and short hitches in busy places, more so in long sessions. Frame generation adds its
+  own memory and GPU work on top. If that happens, use the FSR-upscaled 1440p profile.
+- **POTATO** is an experiment: unlocked, with the resolution lowered so the GPU keeps up at 60. The frame rate here is limited
+  by the CPU's work per draw, not by resolution, so 60 holds in light places (interiors, dungeons) while Hyrule Field,
+  Castle Town and Kakariko run about 35-48 and judder between 30 and 60 on a 60 Hz TV.
+- **On a 1080p TV**, the 1080p profiles are the better choice: the TV would scale a 1440p signal back down.
+- **Frame generation** in these profiles is Longshot's built-in one (`RX_VK_FRAMEGEN=1`, `RX_VK_MIHAWKGEN=0`), from a locked
+  30 to 60 shown: far less ghosting than MihawkGen. FSR's frame generation is not used: it breaks the HUD and ghosts.
+
+**Lines you may change** (each profile has them at the top, with a comment):
 
 | Line | Meaning |
 |---|---|
-| `HOS_PERF_30=1` | Locked, evenly paced 30: each frame shown for exactly two vblanks |
-| `HOS_KLOG=0` | Quiet log, worth 1–2%. Remove it or set it to 1 when you want a log to read via kernel logger |
-| `HOS_HANDHELD=1` | The game's handheld profile (3D at 1536×864). `0` with `HOS_OUTPUT_RES=1920x1080`: docked 1080p (more memory) |
-| `RX_VK_RECORDER=thread` | Vulkan commands recorded on a thread of their own (Longshot #1866): 9.4 → 8.4 µs a draw |
-| `RX_VK_READBACK_LATE=newest` | The game's reads of GPU results don't wait for the newest frame: 4.2 → 0.8 ms of waiting a frame |
-| `RX_VK_OCC_QUERIES=0` | No occlusion queries: heavy scenes 22.9 → 28–29 fps, about 200 MB more textures |
-| `RX_VK_UPLOAD_BUDGET_MS=20` | Spreads texture uploads over frames: frames with uploads over 40 ms 16 → 3 |
-| `RX_VK_LIGHT_CAP=0` | The local-light cap, off (keep it at 0: any other value makes water reflections flash in long sessions; see [Known issues](#status-and-performance)) |
+| `HOS_KLOG=0` | Quiet log, worth 1–2%. Set it to 1 when you want a log to send with a problem (read via the kernel logger) |
+| `HOS_PERF_30=1` | Locked, evenly paced 30: each frame shown for exactly two refreshes. `0`: unlocked |
 | `RX_VK_UP_SHARPEN=15` | Sharpening of the 3D before the HUD, 0–100 |
-| `RX_VK_FRAMEGEN=1` | Frame generation (PS5_MihawkGen) to 60 shown, off by default |
+| `HOS_RES_SCALE` | The 3D's size as a share of the output (`1`: the output's size; `0.75`: FSR 3.1 upscales from 75%) |
+| `#HOS_SPRINT=0`, `#HOS_SPRINT_TOGGLE=0` | Remove the `#` to turn Sprint off, or to sprint only while L3 is held |
+| `RX_VK_LIGHT_CAP=0` | Keep it at 0: any other value makes water reflections flash in long sessions (see [Known issues](#status-and-performance)) |
 
-If you want to use framegen, I suggest using this configuration:
-`RX_VK_FRAMEGEN=1`
-`RX_VK_MIHAWKGEN=0`
-This disables MihawkGen and instead uses the built-in Longshot framegen. It causes way less ghosting and I believe is superior.
-FSR framegen is out of the question - it causes lots of graphical glitches in the HUD and ghosting.
+The rest of each profile is marked "tested values, don't change": the memory settings (the texture reserve, whose 2048 crashes
+a base PS5, and the texture budget) and the performance settings this port's numbers were measured with.
 
 ---
 

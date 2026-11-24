@@ -6,11 +6,12 @@
 # 0: quiet log, worth 1-2%. Set to 1 (or remove the line) when you want a log to send with a problem.
 HOS_KLOG=0
 
-# ==== PROFILE (RISKY): docked TRUE 1440p, 30 fps, no frame generation ====
+# ==== PROFILE (VERY RISKY): docked TRUE 1440p, 30 fps, frame generation to 60 ====
 # the game's docked profile with the 3D drawn at a native 2560x1440 (FSR 3.1 as anti-aliasing only), sent to the TV at 1440p.
 # RISKY: in testing this used ~500 MB more memory than handheld and hit memory emergencies in Castle Town: expect blurry
 # (low-resolution) textures and short hitches in busy places, more so in long sessions. If that happens, use the
-# FSR-upscaled 1440p profile instead. No frame generation here: it would add memory of its own.
+# FSR-upscaled 1440p profile instead. VERY RISKY: frame generation adds its own 1440p frames on top of that memory, and
+# its GPU work on top of native 1440p: the most likely of all the profiles to run short of memory or GPU time.
 HOS_HANDHELD=0
 HOS_OUTPUT_RES=2560x1440
 HOS_PS5_DISPLAY=2560x1440
