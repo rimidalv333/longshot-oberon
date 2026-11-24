@@ -128,10 +128,13 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
   - the title and update inside the `.nup`;
   - every file the build reads, against the SHA-256 the `.nup` itself holds for it;
   - the game's program after extraction, against the known 1.1.1 hashes (`main` starts `2591fb99`).
+ 
+  MD5:e5b85cea14686c5c6c75d05d57cb78a3
+  SHA-256:a6c3a78cc8eae635b70c8cf8c4871685fa1fb204279169f30efbb62ab9e98be5
 
   Other versions are not supported (`--skip-hash-check` builds anyway, at your own risk). If the builder reports
   re-reads, or a file fails its hash only now and then, the PC's memory is returning wrong bytes: test it (MemTest86) and
-  turn off memory overclocking (XMP/EXPO) before trusting a build.
+  turn off memory overclocking (XMP/EXPO) before trusting a build (Including this because my own RAM was going bad while working on this)
 - **The console:** a **base PS5** (disc or digital) on a jailbroken firmware with a homebrew environment (kstuff,
   elfldr, ShadowMountPlus) and an FTP server (ftpsrv). The Pro has more memory and native mesh shaders; this port does
   not target it. FALLBACK MESH SHADERS AS COMPUTE SHADERS ARE USED HERE.
