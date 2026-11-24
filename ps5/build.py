@@ -328,8 +328,8 @@ def main():
     print("ps5: %d compiled, %d failed (%.0f s)" % (built, len(failed), time.time() - t0), flush=True)
     if failed:
         return 1
-    with open(os.path.join(OUT, "objects.txt"), "w") as f:
-        f.write("\n".join(j[1] for j in jobs) + "\n")
+    with open(os.path.join(OUT, "objects.txt"), "w") as f:   # (quoted: a folder with a space in its name)
+        f.write("\n".join('"%s"' % j[1].replace("\\", "\\\\").replace('"', '\\"') for j in jobs) + "\n")
     if a.compile_only:
         return 0
     env = dict(os.environ, PS5_PAYLOAD_SDK=SDK, PS5_VULKAN=VULKAN, PS5_FFMPEG=FFMPEG)
@@ -358,7 +358,14 @@ def main():
         # the link's own code generation follows: the renderer's thread_locals would become __emutls_v.* while the rest of the
         # title (and ps5-pie-tls.ld, host/ps5/tls_check.c) has them native. The later option wins. With PS5_NATIVE_TLS=0 the
         # wrapper's emulated TLS is everyone's, so it is left)
-        extra = "--thinlto-jobs=%d --thinlto-cache-dir=%s" % (max(1, a.jobs), os.path.join(OUT, "lto-cache"))
+        # (PS5_LINK_EXTRA is split on spaces by link.sh: the cache folder as a path without one, relative where it must be)
+        cache = os.path.join(OUT, "lto-cache")
+        if " " in cache:
+            cache = os.path.relpath(cache)
+        if " " in cache:
+            sys.exit("ps5/build.py: PS5_VK_LTO=thin: the build folder's path has a space (%s): move it, or build without "
+                     "PS5_VK_LTO" % OUT)
+        extra = "--thinlto-jobs=%d --thinlto-cache-dir=%s" % (max(1, a.jobs), cache)
         if NATIVE_TLS:
             extra += " -mllvm -emulated-tls=0"
         env["PS5_LINK_EXTRA"] = (env.get("PS5_LINK_EXTRA", "") + " " + extra).strip()
