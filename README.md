@@ -30,7 +30,7 @@
   <tr>
     <td><a href="#credits">Credits</a></td>
     <td><a href="#license">License</a></td>
-    <td></td>
+    <td><a href="!READFIRST_LIMITS_REACHED.md"><b>Limits reached</b></a></td>
   </tr>
 </table>
 
