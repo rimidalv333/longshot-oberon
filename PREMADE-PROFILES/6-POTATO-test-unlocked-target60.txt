@@ -1,0 +1,58 @@
+# Longshot Oberon: longshot_env.txt. One NAME=value per line, # for comments. Copy this file into the title folder on the
+# console as longshot_env.txt (replace the old one). Every line here either matters or is meant to be changed; the rest
+# are the built-in defaults.
+
+# ---- logging ----
+# 0: quiet log, worth 1-2%. Set to 1 (or remove the line) when you want a log to send with a problem.
+HOS_KLOG=0
+
+# ==== PROFILE (proof of concept): unlocked, aiming at a native 60, no frame generation ====
+# The frame rate is limited by the CPU's work per draw, not by resolution: 60 holds in light places (interiors, dungeons,
+# quiet field views); busy views (Hyrule Field, Castle Town, Kakariko) run ~35-48 and will judder between 30 and 60 on a
+# 60 Hz TV. The resolution is lowered only so the GPU keeps up at 60 (16.7 ms a frame): handheld, 3D at 0.75 (1152x648),
+# upscaled by FSR 3.1 to 1536x864, shown at 1920x1080. For more: the mods folder's _PerfShadowLite (rename it without the
+# leading _ and add _ to PerfShadow500) cuts shadow draws, and a lower field_of_view in longshot_options.ini draws less.
+HOS_HANDHELD=1
+HOS_RES_SCALE=0.75
+
+# ---- frame rate ----
+# unlocked (up to the TV's 60). 1: locked 30
+HOS_PERF_30=0
+
+# ---- picture ----
+# sharpening of the 3D before the HUD, 0-100
+RX_VK_UP_SHARPEN=15
+# the local-light cap: leave at 0 (off). Any other value makes water reflections flash in long sessions
+RX_VK_LIGHT_CAP=0
+
+# ---- sprint on L3 ----
+# on by default: a press starts it, Link stopping or the next press ends it
+# HOS_SPRINT=0: off, L3 is the game's LS again. HOS_SPRINT_TOGGLE=0: sprint only while L3 is held
+#HOS_SPRINT=0
+#HOS_SPRINT_TOGGLE=0
+
+# ---- memory: tested values, don't change ----
+# kept free for the game; below it new textures come in at low resolution. DO NOT raise it to 2048: hard crash on a base PS5
+HOS_PS5_TEX_RESERVE_MB=1024
+# the textures' budget. 1536 caused memory emergencies and blurry textures in Castle Town
+RX_VK_VRAM_MB=1280
+RX_VK_TEX_MAX_DIM=1024
+RX_VK_TEX_SKIP_MB=32
+RX_VK_EVICT_PAUSE_AGE=1
+RX_VK_EVICT_KEEP=0
+RX_VK_PRESS_TIERS=0
+RX_VK_UPLOAD_BUDGET_MS=20
+
+# ---- performance: tested values, don't change ----
+RX_VK_RECORDER=thread
+RX_VK_OCC_QUERIES=0
+RX_VK_READBACK_LATE=newest,3980
+HOS_OBJ_CACHE=16384
+HOS_NATIVE_ZSTD=2
+HOS_VCORES=0
+HOS_SPIN_OTHER_US=5
+HOS_LIGHT_LAG=0
+
+# ---- shader cache: don't remove (removing them makes the console prepare its shaders again, hours) ----
+RX_VK_MESH_NOCULL=2c56dc1006942f74
+RX_VK_TASK_NOOCCL=2c56dc1006942f74

@@ -1,0 +1,63 @@
+# Longshot Oberon: longshot_env.txt. One NAME=value per line, # for comments. Copy this file into the title folder on the
+# console as longshot_env.txt (replace the old one). Every line here either matters or is meant to be changed; the rest
+# are the built-in defaults.
+
+# ---- logging ----
+# 0: quiet log, worth 1-2%. Set to 1 (or remove the line) when you want a log to send with a problem.
+HOS_KLOG=0
+
+# ==== PROFILE (RISKY): docked TRUE 1440p, 30 fps, no frame generation ====
+# the game's docked profile with the 3D drawn at a native 2560x1440 (FSR 3.1 as anti-aliasing only), sent to the TV at 1440p.
+# RISKY: in testing this used ~500 MB more memory than handheld and hit memory emergencies in Castle Town: expect blurry
+# (low-resolution) textures and short hitches in busy places, more so in long sessions. If that happens, use the
+# FSR-upscaled 1440p profile instead. No frame generation here: it would add memory of its own.
+HOS_HANDHELD=0
+HOS_OUTPUT_RES=2560x1440
+HOS_PS5_DISPLAY=2560x1440
+HOS_RES_SCALE=1
+
+# ---- frame rate ----
+# locked, evenly paced 30 (each frame shown for two refreshes). 0: unlocked
+HOS_PERF_30=1
+
+# ---- frame generation: the game at a locked 30, 60 shown (Longshot's own generator) ----
+RX_VK_FRAMEGEN=1
+RX_VK_MIHAWKGEN=0
+
+# ---- picture ----
+# sharpening of the 3D before the HUD, 0-100
+RX_VK_UP_SHARPEN=15
+# the local-light cap: leave at 0 (off). Any other value makes water reflections flash in long sessions
+RX_VK_LIGHT_CAP=0
+
+# ---- sprint on L3 ----
+# on by default: a press starts it, Link stopping or the next press ends it
+# HOS_SPRINT=0: off, L3 is the game's LS again. HOS_SPRINT_TOGGLE=0: sprint only while L3 is held
+#HOS_SPRINT=0
+#HOS_SPRINT_TOGGLE=0
+
+# ---- memory: tested values, don't change ----
+# kept free for the game; below it new textures come in at low resolution. DO NOT raise it to 2048: hard crash on a base PS5
+HOS_PS5_TEX_RESERVE_MB=1024
+# the textures' budget. 1536 caused memory emergencies and blurry textures in Castle Town
+RX_VK_VRAM_MB=1280
+RX_VK_TEX_MAX_DIM=1024
+RX_VK_TEX_SKIP_MB=32
+RX_VK_EVICT_PAUSE_AGE=1
+RX_VK_EVICT_KEEP=0
+RX_VK_PRESS_TIERS=0
+RX_VK_UPLOAD_BUDGET_MS=20
+
+# ---- performance: tested values, don't change ----
+RX_VK_RECORDER=thread
+RX_VK_OCC_QUERIES=0
+RX_VK_READBACK_LATE=newest,3980
+HOS_OBJ_CACHE=16384
+HOS_NATIVE_ZSTD=2
+HOS_VCORES=0
+HOS_SPIN_OTHER_US=5
+HOS_LIGHT_LAG=0
+
+# ---- shader cache: don't remove (removing them makes the console prepare its shaders again, hours) ----
+RX_VK_MESH_NOCULL=2c56dc1006942f74
+RX_VK_TASK_NOOCCL=2c56dc1006942f74
