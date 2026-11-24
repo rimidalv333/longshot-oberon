@@ -1,4 +1,4 @@
-## Limits reached
+## LIMITS REACHED
 
 This port runs close to several of the base PS5's limits. They are listed here so it's clear why some settings are what
 they are, and where future work has the least room.
@@ -32,3 +32,4 @@ already running (kstuff, ftpsrv, ShadowMountPlus, elfldr, klogsrv). With those l
   `.bss`. If the link stops with `.bss ... is over PS5_BSS_LIMIT_MB`, that is the reason. Raising the limit is not the
   fix: it trades a build error for a console that won't start the title, or crashes.
 - Running fewer payloads gives a little more room, but the port doesn't rely on that.
+THIS WAS TESTED WITH SHADOWMOUNT, KSTUFF, FTPSRV, PLDMGR, ELFLDR & KLOGSRV running. HEAVY PAYLOADS LIKE ETAHEN OR OTHER DERIVATIVES UNTESTED WITH THIS TITLE RUNNING.
