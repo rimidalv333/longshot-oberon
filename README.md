@@ -107,7 +107,7 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
   from 12–14 µs at the first boot. The GPU has headroom (about 10 ms a frame on average).
 - **Picture:** the game's handheld profile (3D at 1536×864) with AMD FSR 3.1 as anti-aliasing, sharpened before the HUD
   and shown at 1920×1080. Docked 1080p works too, but costs 130–450 MB more memory and doesn't raise the frame rate; it
-  ran short of memory in the market.
+  ran short of memory in the market (this doesn't mean it crashed - it only triggered a downgrade of some textures as fallback).
 
 **Known issues**
 - The building wall that lit up as you came close is fixed by capping the local-light list (`RX_VK_LIGHT_CAP=8`). With
