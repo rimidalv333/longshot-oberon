@@ -24,7 +24,7 @@
   </tr>
   <tr>
     <td><a href="#custom-implementations">Custom implementations</a></td>
-    <td><a href="#manual-fixes-and-tests">My own manual fixes and tests</a></td>
+    <td><a href="#my-own-manual-fixes-and-tests">My own manual fixes and tests</a></td>
     <td><a href="#build-from-source">Build from source</a></td>
   </tr>
   <tr>
