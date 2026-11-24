@@ -35,8 +35,8 @@
 </table>
 
 ---
-> [!CAUTION]
-> So far playtested by me from newgame up until Zora's river (Death Mountain, Dodongo and Goron city included) with no
+> [!In-game progress testing]
+> So far play-tested by me from new game up until Zora's River (Death Mountain, Dodongo and Goron city included) with no
 > glaring faults observed apart from slight hitches upon entering new areas or some enemies/objects needing a second
 > or two to render properly on the screen.
 
