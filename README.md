@@ -8,7 +8,7 @@
 
 <p align="center">
   <b>The Legend of Zelda: Ocarina of Time (Switch 2) recompiled, running natively on the base PlayStation 5</b><br>
-  Title <code>PPSA93339</code> · locked 30 fps · built from your own game file in one command
+  Title <code>PPSA93339</code> · locked 30 fps STABLE up to 60 with built-in framegen · built from your own game file in one command
 </p>
 
 <table align="center">
@@ -24,7 +24,7 @@
   </tr>
   <tr>
     <td><a href="#custom-implementations">Custom implementations</a></td>
-    <td><a href="#manual-fixes-and-tests">Manual fixes and tests</a></td>
+    <td><a href="#manual-fixes-and-tests">My own manual fixes and tests</a></td>
     <td><a href="#build-from-source">Build from source</a></td>
   </tr>
   <tr>
@@ -110,18 +110,17 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
   ran short of memory in the market (this doesn't mean it crashed - it only triggered a downgrade of some textures as fallback).
 
 **Known issues**
-- The building wall that lit up as you came close is fixed by capping the local-light list (`RX_VK_LIGHT_CAP=8`). With
-  the cap, a screen cell takes at most 8 local lights (torches, lamps, Navi's glow); the sun is unaffected.
-- One game-code crash was seen once, in an experiment that ran the game at 9 fps. It has not been seen in normal play.
+- Building wall that lit up as you came close is FIXED by capping the local-light list (`RX_VK_LIGHT_CAP=64`) - sun is unaffected.
+- One game-code crash was seen once, in a diagnostic experiment that ran the game at 9 fps. It has not been seen in normal play.
 - The first start translates every shader (several hours, once). See [First start](#first-start).
-
+- Slight hitches can occur during sudden camera  turns (180deg.) but only when facing a very busy area (a lot of draws)
 ---
 
 ## Install and play
 
 ### What you need
 
-- **The game:** *The Legend of Zelda: Ocarina of Time* for Nintendo Switch 2, version 1.1.1 (title `0400486024DEC000`,
+- **The game:** *LoZ OOT* for NS2, version 1.1.1 (title `0400486024DEC000`,
   v131072), dumped by yourself as a `.nup` file. The builder checks it against this dump:
   - size: 25,020,741,061 bytes
   - SHA-256: `5a23bbbb382193020eb7235ea21c368bfd8473e7795d24e17a487f43380ce74c`
@@ -129,9 +128,9 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
   Other versions or dumps are not supported (`--skip-hash-check` builds anyway, at your own risk).
 - **The console:** a **base PS5** (disc or digital) on a jailbroken firmware with a homebrew environment (kstuff,
   elfldr, ShadowMountPlus) and an FTP server (ftpsrv). The Pro has more memory and native mesh shaders; this port does
-  not target it.
+  not target it. FALLBACK MESH SHADERS AS COMPUTE SHADERS ARE USED HERE.
 - **The PC:** 64-bit Linux, or Windows 10/11 with WSL2 (Ubuntu). At least 8 GB of memory for the build (the builder runs
-  one compile per 6 GB), about 10 GB of free disk space, and 30–120 minutes depending on your cores.
+  one compile per 6 GB), about 10 GB of free disk space, and 30–120 minutes depending on your machine.
 
 ### Build the title
 
@@ -188,6 +187,7 @@ name starts with `_` is skipped, so renaming a folder turns a mod on or off. The
 | `_Saturation130` | no | The same at 1.30 | Visual only |
 
 Use one shadow mod and one saturation mod at a time: each pair replaces the same file.
+WARNING: Any other mods have not been tested. This is very experimental.
 
 **PS5 button prompts.** The builder runs Longshot's prompt generator on your game files. It redraws the game's button
 icons (dialogue, hints, menus, the ocarina notes, the pause-menu controller) for other controllers from Kenney's CC0
@@ -209,18 +209,21 @@ Two text files beside `eboot.bin` hold the settings. Edit them on the console ov
 | Line | Meaning |
 |---|---|
 | `HOS_PERF_30=1` | Locked, evenly paced 30: each frame shown for exactly two vblanks |
-| `HOS_KLOG=0` | Quiet log, worth 1–2%. Remove it when you want a log to read |
+| `HOS_KLOG=0` | Quiet log, worth 1–2%. Remove it or set it to 1 when you want a log to read via kernel logger |
 | `HOS_HANDHELD=1` | The game's handheld profile (3D at 1536×864). `0` with `HOS_OUTPUT_RES=1920x1080`: docked 1080p (more memory) |
 | `RX_VK_RECORDER=thread` | Vulkan commands recorded on a thread of their own (Longshot #1866): 9.4 → 8.4 µs a draw |
 | `RX_VK_READBACK_LATE=newest` | The game's reads of GPU results don't wait for the newest frame: 4.2 → 0.8 ms of waiting a frame |
 | `RX_VK_OCC_QUERIES=0` | No occlusion queries: heavy scenes 22.9 → 28–29 fps, about 200 MB more textures |
 | `RX_VK_UPLOAD_BUDGET_MS=20` | Spreads texture uploads over frames: frames with uploads over 40 ms 16 → 3 |
-| `RX_VK_LIGHT_CAP=8` | The local-light cap (see [Known issues](#status-and-performance)) |
+| `RX_VK_LIGHT_CAP=64` | The local-light cap (see [Known issues](#status-and-performance)) |
 | `RX_VK_UP_SHARPEN=15` | Sharpening of the 3D before the HUD, 0–100 |
 | `RX_VK_FRAMEGEN=1` | Frame generation (PS5_MihawkGen) to 60 shown, off by default |
 
-For a test run, `longshot_test_env.txt` in the title folder replaces `longshot_env.txt` entirely and accepts any variable.
-Delete it before playing.
+If you want to use framegen, I suggest using this configuration:
+`RX_VK_FRAMEGEN=1`
+`RX_VK_MIHAWKGEN=0`
+This disables MihawkGen and instead uses the built-in Longshot framegen. It causes way less ghosting and I believe is superior.
+FSR framegen is out of the question - it causes lots of graphical glitches in the HUD and ghosting.
 
 ---
 
@@ -270,7 +273,8 @@ Built for this port, for the base PS5. Each has a switch to turn it off. They ar
   same mismatch: with NGG on, long passes of lit draws stalled the GPU (the Kakariko gate, the night market's pine tree)
   until the console killed the title. Off, the hang was gone and the frame rate was unchanged.
 - **GPU-hang watchdog.** After 3 seconds without a finished submission the title ends itself, with a GPU state dump in
-  the log. (`RX_VK_GPU_HANG_SEC=3`)
+  the log. (`RX_VK_GPU_HANG_SEC=3`). This also helps by not letting the console hard crash during any GPU hangs which
+  could cause irreversible system corruption (reported by a tester on the early PS5_Hookshot - a crash caused a system restore)
 
 ### CPU: the replay and the game's threads
 
@@ -290,7 +294,7 @@ Built for this port, for the base PS5. Each has a switch to turn it off. They ar
 ### Picture and sound
 
 - **The sky fix.** New half-screen depth images start at "far" (1.0) instead of 0.0, so the Hyrule Field clouds no longer
-  drop out for single frames.
+  drop out for single frames and  they no longer flash.
 - **Depth-comparison dummy.** Empty shadow-map slots read as lit, not black: correct shading where the game binds none.
 - **5.1 mixed down to stereo** for the console's output.
 - **Black props fixed.** The shader translator's guest page table now starts at the PS5 heap's address (16 GB), so the
@@ -308,10 +312,10 @@ Built for this port, for the base PS5. Each has a switch to turn it off. They ar
 
 ---
 
-## Manual fixes and tests
+## My own manual fixes and tests
 
-Everything here was found and confirmed by playing on a base PS5 with a kernel log (klog) running: more than 150 logged runs.
-Each change was tested on its own, with a backup and an off switch, and the logs are the evidence.
+Everything here was found and confirmed by me playing on a base PS5 with a kernel log (klog) running: more than 150 logged runs.
+Each change was TESTED AND FIXED on its own, with a backup and an off switch, and the logs are the evidence.
 
 | Problem | What was seen | Cause | Fix |
 |---|---|---|---|
@@ -386,8 +390,8 @@ Then copy `longshot_shaders.bin`, `prompts/` and the contents of `title/` into `
 
 **Rules for changes**
 - Don't change the *stamped* files (`gpu/vk/vk_shader.cpp`, `vk_bank.cpp`, `vk_state.h`, `gpu/vk/eden/`, `sirit/`,
-  `compat/`) unless you mean to. Any change to them makes every console translate all its shaders again. The build
-  prints the stamp.
+  `compat/`) unless you mean to. Any change to them makes every console translate all its shaders again. (THIS CAN TAKE ANOTHER COUPLE OF HOURS)
+  The build prints the stamp.
 - Nothing that raises memory use goes in without a guard that backs off under the texture reserve.
 
 ---
@@ -412,7 +416,6 @@ Then copy `longshot_shaders.bin`, `prompts/` and the contents of `title/` into `
 | [HeyListen](https://github.com/Sacrappy/HeyListen) | Sacrappy | Texel copies without the virtual core (0.4.1), the exposure-meter fix (`33873659`, from Hookshot `53eb0441` by pixl27), kept descriptor pools (`6ed31109`) |
 | [Rekarina](https://git.rekarina.dev/rekarina/rekarina) | Rekarina | Ideas only: reading the light-injection uniforms in place, early light results |
 | [totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp) | valentderah | Through Hookshot: the virtual cores' design and the host zstd decoder |
-| [heydemoura/PS5_Longshot](https://github.com/heydemoura/PS5_Longshot) | heydemoura | Read for comparison; its PRs #11 and #23 are the same Longshot fixes taken here from Longshot |
 
 **Libraries and tools**
 
@@ -439,8 +442,7 @@ Every vendored component's provenance and license text is beside it: `third_part
 ([Tom's Hardware](https://www.tomshardware.com/news/amd-oberon-playstation-5-soc-die-says-cheese-to-the-camera)), with
 Longshot's icon.
 
-*The Legend of Zelda: Ocarina of Time* is © Nintendo. This project contains no game code or data and is not affiliated
-with Nintendo or Sony. Build only from a game you own.
+This project contains no game code or data and is not affiliated with Nintendo or Sony. Build only from a game you own.
 
 ---
 
