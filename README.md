@@ -246,6 +246,8 @@ generation.
 | [`1-SAFE-handheld-30`](PREMADE-PROFILES/1-SAFE-handheld-30.txt) | Handheld | 1080p | 1536×864 | Anti-aliasing | Locked 30 |
 | [`2-docked-1080p-30`](PREMADE-PROFILES/2-docked-1080p-30.txt) | Docked | 1080p → 1080p | 1920×1080 | Anti-aliasing | Locked 30 |
 | [`3-docked-1080p-60-framegen`](PREMADE-PROFILES/3-docked-1080p-60-framegen.txt) | Docked | 1080p → 1080p | 1920×1080 | Anti-aliasing | Locked 30, 60 shown with frame generation |
+| [`2b-docked-1080p-fsr-upscaled-30`](PREMADE-PROFILES/2b-docked-1080p-fsr-upscaled-30.txt) | Docked | 1080p → 1080p | 1536×864 | Upscaling to 1080p | Locked 30 |
+| [`3b-docked-1080p-fsr-upscaled-60-framegen`](PREMADE-PROFILES/3b-docked-1080p-fsr-upscaled-60-framegen.txt) | Docked | 1080p → 1080p | 1536×864 | Upscaling to 1080p | Locked 30, 60 shown with frame generation |
 | [`4-docked-1440p-fsr-upscaled-30`](PREMADE-PROFILES/4-docked-1440p-fsr-upscaled-30.txt) | Docked | 1440p → 1440p | 1920×1080 | Upscaling to 1440p | Locked 30 |
 | [`5-docked-1440p-fsr-upscaled-60-framegen`](PREMADE-PROFILES/5-docked-1440p-fsr-upscaled-60-framegen.txt) | Docked | 1440p → 1440p | 1920×1080 | Upscaling to 1440p | Locked 30, 60 shown with frame generation |
 | [`6-POTATO-test-unlocked-target60`](PREMADE-PROFILES/6-POTATO-test-unlocked-target60.txt) | Handheld | 1080p | 1152×648 | Upscaling to 1536×864 | Unlocked, aiming at a native 60 |
@@ -254,6 +256,9 @@ generation.
 
 - **SAFE** is the setup this port is tested with: the game's handheld profile, its last step to the 1080p screen done by the
   Lanczos filter. The docked profiles draw more and look sharper on a TV, and use more memory (about 130-450 MB at 1080p).
+- **2b / 3b** draw the 3D at SAFE's size (1536×864), and FSR 3.1 upscales it to a real 1080p instead of the Lanczos filter
+  stretching it: sharper on a TV, with a native 1080p HUD, for about SAFE's memory plus the 1080p output buffers (not yet
+  measured on the console).
 - **FSR 3.1 runs in every profile.** Where the 3D is drawn at the output's size it is the game's anti-aliasing; where it is
   drawn smaller, FSR 3.1 also upscales it, rebuilding detail from several frames: the FSR-upscaled 1440p profiles look
   between 1080p and native 1440p, with a native 1440p HUD.
