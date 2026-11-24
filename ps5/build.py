@@ -96,6 +96,23 @@ def cc_wrapper(cxx=False):
     return ["sh", os.path.join(VULKAN, "tooling", "prospero-clang18")] + (["-x", "c++"] if cxx else [])
 
 
+# (2026-11-24) An object's key holds its flags and its headers' paths, which name the folders the build is in. They are put in
+# the keys as names (<root>, <deps>, ...), not where they are, so a tree that moves (or a WSL path against another view of the
+# same drive) keeps every object it compiled. The longest first: deps/ sits inside the tree
+# (each as given and as the system resolves it: a folder reached through a link has two spellings, and both can turn up)
+_PLACES = sorted({(spell(p), name) for p, name in (
+    (DEPS, "<deps>"), (SDK, "<sdk>"), (VULKAN, "<vulkan>"), (MIHAWKGEN, "<mihawkgen>"), (kit.WORK, "<work>"),
+    (ROOT, "<root>")) + (((os.path.dirname(DEPS), "<root>"),) if os.path.basename(DEPS.rstrip("/")) == "deps" else ())
+    for spell in (os.path.abspath, os.path.realpath)}, key=lambda pn: -len(pn[0]))   # (build.sh's deps/ is in the tree)
+
+
+def placeless(text):
+    """text with the build's folders named, not located (_PLACES)"""
+    for path, name in _PLACES:
+        text = text.replace(path, name)
+    return text
+
+
 def tree_digest(*dirs, ext=(".h", ".hpp", ".inc")):
     h = hashlib.sha1()
     for d in dirs:
@@ -103,7 +120,7 @@ def tree_digest(*dirs, ext=(".h", ".hpp", ".inc")):
             for f in sorted(files):
                 if f.endswith(ext):
                     p = os.path.join(base, f)
-                    h.update(p.encode())
+                    h.update(placeless(p).encode())
                     with open(p, "rb") as fh:
                         h.update(fh.read())
     return h.hexdigest()
@@ -266,7 +283,7 @@ def jobs_for(rt64, gen_dir):
 
 
 def key_of(src, flags, digest):
-    h = hashlib.sha1(" ".join(flags).encode() + digest.encode())
+    h = hashlib.sha1(placeless(" ".join(flags)).encode() + digest.encode())
     with open(src, "rb") as f:
         h.update(f.read())
     return h.hexdigest()
