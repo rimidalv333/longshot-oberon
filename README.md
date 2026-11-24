@@ -65,7 +65,7 @@ it was merged with Longshot v3.0.0-rc.4 and has followed Longshot's releases and
 by hand, with the base-console work described below on top.
 
 **What it is not.** It is not a fork of, and does not build on,
-[heydemoura/PS5_Longshot](https://github.com/heydemoura/PS5_Longshot). That project is aimed at the PS5 Pro and is a
+[heydemoura/PS5_Longshot](https://github.com/heydemoura/PS5_Longshot). That project was initially aimed at the PS5 Pro (inherited from Mihawk's) and is a
 separate line of work. Two fixes are shared because both projects took them from Longshot (the voices' romfs paths,
 Longshot #1346, and the stepped character-shadow storage, Longshot #1256).
 
