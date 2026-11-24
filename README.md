@@ -119,6 +119,18 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
 - Slight hitches can occur during sudden camera  turns (180deg.) but only when facing a very busy area (a lot of draws)
 ---
 
+> [!CAUTION]
+> **Files in the title folder that can't be deleted.** Some files the title creates on the console, mostly in
+> `cache/` (the shader cache, `longshot_swap.bin`), can refuse to be deleted or overwritten over FTP because of the
+> permissions they were created with. Set the folder's permissions to `777` recursively, then delete:
+>
+> - **FileZilla (or a similar FTP client):** right-click the folder → *File permissions…* → numeric value `777`,
+>   tick *Recurse into subdirectories* → *Apply to all files and directories* → OK. Then delete the files.
+> - **A shell on the console:** `chmod -R 777 /data/homebrew/PPSA93339` and then `rm` what you need to remove.
+>
+> Only do this **inside `/data/homebrew/PPSA93339`**. Never change permissions on system folders or anything
+> outside your homebrew folders. Close the title before you delete anything from it.
+
 ## Install and play
 
 ### What you need
