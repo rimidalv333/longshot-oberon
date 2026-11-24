@@ -1,0 +1,39 @@
+#version 460
+// (base PS5, RX_VK_FB_MULTI) The mesh fallback's indirect draws, record by record. mesh_indirect_convert copied the game's
+// n records as {count, 1, 1} into the ring, and the draw's count word right after them when it has a count buffer. For each
+// record this writes, past the count word: the mesh stage's dispatch (a task program's slots: count * threads, at most the
+// fallback's capacity; a mesh program's workgroups: count) and the generated vertex stage's draw (those slots' vertices).
+// Records at and past the count get 0 workgroups, as vkCmdDrawMeshTasksIndirectCountEXT leaves them out natively.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+layout(push_constant) uniform Push {
+    uint64_t records;   // the ring's records: n * 3 words, then the count word, then n * 8 words of arguments
+    uint n;
+    uint has_count;
+    uint per_group;     // slots a workgroup of the record starts: the task's threads, or 1
+    uint vertices;      // vertices a slot draws (fallback_vertices_per_workgroup)
+    uint capacity;      // MESH_FALLBACK_CAPACITY
+    uint pad;
+} pc;
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    Words r = Words(pc.records);
+    uint groups = r.w[i * 3u];
+    if (pc.has_count != 0u && i >= r.w[pc.n * 3u]) {
+        groups = 0u;
+        r.w[i * 3u] = 0u;
+    }
+    const uint slots = min(groups * pc.per_group, pc.capacity);
+    const uint at = pc.n * 3u + 1u + i * 8u;   // (word index: 32 bytes a record, from the word after the count)
+    r.w[at + 0u] = slots;                     // VkDispatchIndirectCommand
+    r.w[at + 1u] = 1u;
+    r.w[at + 2u] = 1u;
+    r.w[at + 3u] = 0u;
+    r.w[at + 4u] = slots * pc.vertices;       // VkDrawIndirectCommand
+    r.w[at + 5u] = 1u;
+    r.w[at + 6u] = 0u;
+    r.w[at + 7u] = 0u;
+}

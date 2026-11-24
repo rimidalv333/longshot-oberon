@@ -1,0 +1,14 @@
+# ---- never commit the game or anything made from it ----
+/work/
+/dist/
+*.nup
+*.nsp
+*.xci
+*.keys
+# ---- the bundled build tools (in the release zip, not in git) ----
+/deps/
+# ---- build leftovers ----
+__pycache__/
+*.pyc
+*.o
+*.log
