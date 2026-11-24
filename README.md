@@ -36,7 +36,9 @@
 
 ---
 > [!CAUTION]
-> Not playtested after getting Zelda's Letter, if any crashes occur I will try to update with each release.
+> So far playtested by me from newgame up until Zora's river (Death Mountain, Dodongo and Goron city included) with no
+> glaring faults observed apart from slight hitches upon entering new areas or some enemies/objects needing a second
+> or two to render properly on the screen.
 
 ## Introduction
 
