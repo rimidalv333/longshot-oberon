@@ -544,6 +544,20 @@ void prepare_background();
 void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)
 /// (longshot) A prediction a start began and did not finish (closed, or ended in it): the next start runs it again
 bool predict_pending();   // vk_draw.cpp
+/// (SL1) the shipped pipeline list new or replaced since the last preparation that read it (size, time, program cache stamp), and
+/// its mark, written once a start's preparation is through (vk_draw.cpp)
+bool shipped_states_changed();
+void shipped_states_mark();
+/// (DC1) whether this start prepares (translation, a new shipped list, notes not built yet): files only, asked before the instance
+bool preparation_ahead();
+/// (KR1) kept-ready pipelines no draw took for a while let go (vk_draw.cpp; once a present, from status_tick)
+void kept_ready_sweep();
+/// (LP1) the state list's count: phase 0 none, 1 its programs translated, 2 read in, 3 its pipelines noted (vk_draw.cpp)
+void state_list_progress(int* phase, size_t* done, size_t* total);
+/// (DC1) the driver's own disk cache was switched off for this start's preparation (vk_main.cpp)
+extern bool driver_cache_off_for_prepare;
+/// (PK1) the warm pass built pipelines at this start (a pipeline pack made, notes built): the console closes after it, as after a preparation
+extern bool precompile_warmed_now;
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
 /// (longshot) Compile shaders: whether a preparation builds the predicted pipelines too (All), or leaves them out (Most, the
 /// default). RX_VK_COMPILE_SHADERS=all or most (the game's --compile-shaders), else compile_shaders= in longshot_options.ini

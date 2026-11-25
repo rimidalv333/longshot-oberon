@@ -143,6 +143,8 @@ struct StartupState {
     bool prepared = false, finished = false, stopping = false;
     bool saving = false;   // (the pipeline cache written out, every pipeline counted: prepare_saving)
     double whole = -1;   // (the bar over every part, PrepareBar::fraction; negative: the bar is this part's done of total)
+    int list_phase = 0;   // (LP1: the state list's part, state_list_progress: 1 translated, 2 read in, 3 noted; 0 none)
+    size_t list_done = 0, list_total = 0;
 };
 
 /// What goes under the bar on the right: the time left while there is work counted, and once all of it is (the bar full, the
@@ -221,6 +223,16 @@ inline StartupView startup_view(const StartupState& s) {
         return v;
     }
     if (s.secs < 1.0) return v;
+    // (LP1) the pipeline list's own step, between the shaders and the pipelines: its count under the bar, the bar where it is
+    if (s.list_phase && s.list_total) {
+        if (s.prepared) v.step = "STEP 1 OF 2", v.hint = "This happens once after an update. Closing the window keeps what is done.";
+        v.title = "Preparing shaders";
+        static const char* const what[] = {"", " list programs translated", " list programs read", " list pipelines noted"};
+        v.left = with_commas(std::min(s.list_done, s.list_total)) + " / " + with_commas(s.list_total) + what[s.list_phase > 3 ? 3 : s.list_phase];
+        if (s.whole >= 0) v.fraction = s.whole, v.pct = percent_of(s.whole);
+        v.right = "Reading the pipeline list";
+        return v;
+    }
     const bool pipelines = s.stage > 0;
     if (s.prepared) v.step = pipelines ? "STEP 2 OF 2" : "STEP 1 OF 2";
     v.title = !pipelines ? "Preparing shaders" : s.prepared ? "Building pipelines" : "Loading pipelines";

@@ -5485,6 +5485,7 @@ void log_frame_stats() {
 /// a look at the driver's allowance, warned of once when the use passes it (again only after it was back under)
 void status_tick() {
     namespace sl = status_line;
+    kept_ready_sweep();   // (KR1: vk_draw.cpp)
     static uint64_t frames = 0;
     // (the slowest frame since the last line, present to present: a stall shows here, to be matched with what the log says
     // around it, such as DLSS's feature made again)

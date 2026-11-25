@@ -18,7 +18,7 @@
 set -euo pipefail
 
 TITLE_ID=PPSA93339
-VERSION=1.1.0
+VERSION=1.2.0
 # (the game's program as the build lifts it, decompressed: the same from any good dump of 1.1.1)
 EXEFS_SHA256="2591fb99008d0814f8056c3f36b36790048ed857ff0ae2bb3a4c1e37b960a4de  main
 94c154d83cbaca00d092958cc2b3a0494d7308fe49de8cb33ece7e9e67303ea7  main.npdm
@@ -169,6 +169,20 @@ title="$root/dist/$TITLE_ID"
 
 step "the title folder"
 cp -- "$assets/longshot_shaders.bin" "$title/"
+# (SL1) The shipped pipeline list: Longshot's pipeline tour and its players' contributed lists (assets/pipeline_states, hashes,
+# formats and draw state only, no game code), merged into the title's longshot_pipeline_states_shipped.bin. The first start builds
+# those pipelines before the title, so what the game draws the first time is ready; an install with a cache builds only what a new
+# list adds. The same sources always merge into the same bytes
+rm -f -- "$title/longshot_pipeline_states_shipped.bin"
+if [[ -d $root/assets/pipeline_states ]]; then
+    if "$python" -I "$root/nx2/pipeline_states.py" merge --dir "$root/assets/pipeline_states" \
+            --out "$title/longshot_pipeline_states_shipped.bin" > "$logs/pipeline_states.log" 2>&1; then
+        note "shipped pipeline list: $(tail -n 1 "$logs/pipeline_states.log")"
+    else
+        rm -f -- "$title/longshot_pipeline_states_shipped.bin"
+        note "no shipped pipeline list (see $logs/pipeline_states.log): pipelines are built when first drawn"
+    fi
+fi
 rm -rf -- "$title/prompts" "$title/mods"
 [[ -d $assets/prompts ]] && cp -r -- "$assets/prompts" "$title/prompts" || note "no button prompts (see $logs/prompts.log): the game shows the Switch's"
 cp -r -- "$root/title/mods" "$title/mods"

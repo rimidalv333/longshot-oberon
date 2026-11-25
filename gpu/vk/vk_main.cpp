@@ -1227,10 +1227,20 @@ void prepare_with_screen() {
         // programs were done, the bar's total held ~58,000 pipelines that were never to be built: 16% shown at 27,000 of 38,809
         // programs, and an estimate of 460 minutes)
         if (!compile_all()) prep_skip[1].store(true);
-        const bool prepared = !update && prepare_run(prep_progress, false);
+        // (SL1: a shipped pipeline list new or replaced since the last preparation: its new programs and pipelines, nothing else)
+        const bool states_new = !update && shipped_states_changed();
+        const bool prepared = !update && prepare_run(prep_progress, false, states_new);
         if (!prepared) prep_skip[0].store(true);
-        // (a first start, or one after a start that did not finish them: the pipelines the notes predict, into the driver's cache)
-        if ((prepared || (!update && predict_pending())) && compile_all() && !prepare_stopped()) {
+        // (a first start, or one after a start that did not finish them: the pipelines the notes predict, into the driver's cache.
+        // (PA1, 2026-11-25) And, as the builder's path does, a folder prepared on Most when Compile shaders is now All: its
+        // prediction never ran, and nothing else would run it (the PS5's starts: RX_VK_COMPILE_SHADERS=all did nothing, 19.log))
+        // (DC1: the prediction builds for the driver's own disk cache alone: with that cache off for this start it waits for the next
+        // start, which no longer prepares and keeps the cache on; predict_pending's marker or the unfinished record bring it back)
+        if (driver_cache_off_for_prepare && (prepared || predict_pending() || !predicted_complete()) && compile_all())
+        {
+            logf("vk: the predicted pipelines wait for the next start (the driver's disk cache is off while this one prepares)");
+            prep_skip[1].store(true);
+        } else if ((prepared || (!update && (predict_pending() || !predicted_complete()))) && compile_all() && !prepare_stopped()) {
             prep_done.store(0), prep_total.store(0);
             prep_stage.store(1);
             predict_run(prep_progress);
@@ -1242,14 +1252,18 @@ void prepare_with_screen() {
             prep_stage.store(2);
             precompile_run(prep_progress);
         }
-        if (prepare_stopped()) pipeline_cache_save(true);   // (the driver's part built so far, for the next start)
-        else if (update) prepare_background();
+        if (prepare_stopped()) {
+            pipeline_cache_save(true);   // (the driver's part built so far, for the next start)
+        } else {
+            shipped_states_mark();   // (SL1: the list as this preparation read it)
+            if (update) prepare_background();
+        }
 #ifdef __PROSPERO__
         // (PS5: a start that translated the programs closes when it is done. The console's heap keeps what the translation took
         // (run A after the preparation: 4.5 GB mapped, 2.1 GB in use, peak 6.5 GB, against ~1 GB on a start with nothing to
         // prepare) and the game ran out of memory in the intro. Everything saved; the next start plays with the heap clear.
         // RX_VK_PS5_PREPARE_STAY=1: plays on, as before)
-        if (prepared && !prepare_stopped() && !env_on("RX_VK_PS5_PREPARE_STAY")) {
+        if ((prepared || states_new || precompile_warmed_now) && !prepare_stopped() && !env_on("RX_VK_PS5_PREPARE_STAY")) {
             pipeline_cache_save(true);
             program_cache_flush();
             logf("vk: the shaders are prepared: the title closes now so that play starts with the memory the preparation took "
@@ -1295,6 +1309,13 @@ void prepare_with_screen() {
             if (stage == 0 && total) prepared = true;
             StartupState st;
             st.stage = stage, st.done = done, st.total = total, st.left = left, st.secs = secs;
+            state_list_progress(&st.list_phase, &st.list_done, &st.list_total);   // (LP1)
+            static double next_list_log = 0;
+            if (st.list_phase && st.list_total && secs >= next_list_log) {
+                static const char* const what[] = {"", "programs translated", "programs read", "pipelines noted"};
+                logf("vk: start-up: pipeline list: %zu of %zu %s", st.list_done, st.list_total, what[st.list_phase > 3 ? 3 : st.list_phase]);
+                next_list_log = secs + 10;
+            }
             st.prepared = prepared, st.finished = finished, st.stopping = prepare_stopped();
             st.saving = prepare_saving();
             st.whole = whole;
@@ -1454,9 +1475,14 @@ bool started_up() {
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
         const bool update = prepare_is_update();   // (an update: what the notes name now, the rest in play)
-        if (!update && (prepare_run(progress, false) || predict_pending()) && compile_all()) predict_run(progress);
+        const bool states_new = !update && shipped_states_changed();   // (SL1, as the screen's path)
+        // (PA1: a folder prepared on Most is brought up to All too, as the builder's path and the screen's do)
+        if (!update && (prepare_run(progress, false, states_new) || predict_pending() || (compile_all() && !predicted_complete())) &&
+            compile_all() && !driver_cache_off_for_prepare)   // (DC1: as the screen's path)
+            predict_run(progress);
         if (update) state_list_run();
         precompile_run(progress);
+        if (!prepare_stopped()) shipped_states_mark();   // (SL1)
         if (update) prepare_background();
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
     }
@@ -1723,6 +1749,21 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
 #endif
         return nullptr;
     }
+#ifdef __PROSPERO__
+    // (DC1, 2026-11-25) A start that prepares runs with the driver's own shader disk cache off. Every pipeline the preparation builds
+    // goes into our pipeline cache, and the driver's cache added a store (and a look-up) of each shader into the title folder's
+    // radv-shader-cache, many small file calls of ~60 ms each there: the pipeline steps ran at ~18 a second on ~4 of 13 CPUs
+    // (25.log). Set before the instance: Mesa reads it when it makes the physical device. Play's starts keep the driver's cache.
+    // RX_VK_PREPARE_DRIVER_CACHE=1: kept on in a preparation too; a MESA_SHADER_CACHE_DISABLE set in the env file wins either way
+    {
+        const char* keep = getenv("RX_VK_PREPARE_DRIVER_CACHE");
+        if (!(keep && atoi(keep) != 0) && !getenv("MESA_SHADER_CACHE_DISABLE") && mkwvk::preparation_ahead()) {
+            setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+            mkwvk::driver_cache_off_for_prepare = true;
+            logf("vk: this start prepares: the driver's own shader disk cache is off for it (RX_VK_PREPARE_DRIVER_CACHE=1: on)");
+        }
+    }
+#endif
     if (!create_instance()) {
         logf("vk: create_instance failed");
         return nullptr;

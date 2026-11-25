@@ -6,6 +6,10 @@
 // and the draws themselves.
 //
 // Pipelines persist in a VkPipelineCache in the game folder's cache/ (longshot_vk_pipelines.bin).
+#ifdef __PROSPERO__
+#include <cerrno>
+#include <unistd.h>   // (PW1: the pipeline cache written in one write() call)
+#endif
 #include <algorithm>
 #include <cmath>     // (RS2: std::isfinite, std::ldexp in record_draw)
 #include <filesystem>
@@ -651,6 +655,230 @@ VkPipelineCache pcache = VK_NULL_HANDLE;
 std::string pcache_path;
 /// (longshot) What the last save on this thread did: a forced save runs on its caller's thread, which reads it (precompile_save.h)
 thread_local precompile_save::Outcome pcache_save_outcome;
+
+// ---- (PK1, 2026-11-25) The pipeline pack: each program's graphics pipelines in a pipeline cache of its own, packed into one file ----
+// With the shipped pipeline list the pipeline cache held 38,390 graphics pipelines: 454 MB, read whole at every start and kept by
+// the driver for the whole run, which left the console's textures short of memory (24.log: 13 emergencies, 61 textures made small;
+// RX_VK_PCACHE_LOAD=0 gave the memory back and cost 1-2% of the frames, 25.log). Here the preparation's warm pass builds each
+// program's noted pipelines into a cache of that program alone and packs its data into cache/longshot_vk_pipelines.pack, with an
+// index (key -> place, size, how many notes it was built for) in longshot_vk_pipelines.pack.idx. In play, a graphics pipeline of a
+// program in the pack is asked of that program's own cache, read in with one read when the thread first needs it and kept until the
+// thread asks for another program's (a lease, pack_start_cache): what stays in memory is the index and one small cache a thread,
+// not every pipeline. The compute pipelines, the stage libraries and the play files stay in the pipeline cache, as before.
+// RX_VK_PIPELINE_PACK=1: on (the preparation builds the pack, play uses it). A pack made for another translator or driver is not
+// read. A program the pack has no part for is asked of the pipeline cache, as before
+namespace pack {
+constexpr char kMagic[8] = {'H', 'K', 'P', 'A', 'C', 'K', '0', '1'};
+struct Head {
+    char magic[8];
+    uint64_t stamp;
+    uint8_t uuid[VK_UUID_SIZE];
+    uint32_t vendor, device;
+};
+struct Rec {   // (the record's head in the pack, before its data; an index entry is the same with the data's place)
+    uint64_t key, size;
+    uint32_t notes, pad;
+};
+struct Entry {
+    uint64_t at = 0, size = 0;
+    uint32_t notes = 0;
+};
+std::mutex mu;   // (the index, the held records and the files)
+std::unordered_map<uint64_t, Entry> index;
+std::vector<uint8_t> held;   // (records not written yet: a preparation's, written 8 MB at a time with one write call)
+FILE* out = nullptr;
+FILE* in = nullptr;
+int64_t end = -1;            // (where the next record goes)
+int64_t written_end = -1;    // (what of the file is on the disk; a read past it flushes first)
+bool opened = false, usable = false;
+bool on() {
+    // (on by default since 1.2.0: RX_VK_PIPELINE_PACK=0 goes back to the one pipeline cache)
+    static const bool v = [] { const char* e = getenv("RX_VK_PIPELINE_PACK"); return e ? !env_value_off(e) : true; }();
+    return v;
+}
+std::string path() { return cache_path("longshot_vk_pipelines.pack"); }
+std::string idx_path() { return path() + ".idx"; }
+Head head_now() {
+    Head h{};
+    std::memcpy(h.magic, kMagic, 8);
+    h.stamp = program_cache_stamp();
+    std::memcpy(h.uuid, dev.props.pipelineCacheUUID, VK_UUID_SIZE);
+    h.vendor = dev.props.vendorID, h.device = dev.props.deviceID;
+    return h;
+}
+/// (mu held) bytes onto a stream's end with as few write calls as the system takes (the console: one), then flushed
+void put(FILE* f, const void* data, size_t n) {
+    if (!f || !n) return;
+    size_t off = 0;
+    fflush(f);
+#ifdef __PROSPERO__
+    static const bool stdio = getenv("RX_VK_DISK_STDIO") && atoi(getenv("RX_VK_DISK_STDIO")) != 0;   // (PW1's switch)
+    const int fd = fileno(f);
+    while (!stdio && off < n) {
+        const ssize_t w = ::write(fd, (const uint8_t*)data + off, n - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+#endif
+    if (off < n) fwrite((const uint8_t*)data + off, 1, n - off, f);
+    fflush(f);
+}
+void flush_locked() {
+    if (held.empty()) return;
+    put(out, held.data(), held.size());
+    written_end += (int64_t)held.size();
+    held.clear();
+}
+/// (mu held) the index file written whole (small: 32 bytes a program)
+void index_write_locked() {
+    std::vector<uint8_t> o;
+    const Head h = head_now();
+    o.insert(o.end(), (const uint8_t*)&h, (const uint8_t*)&h + sizeof h);
+    for (const auto& [key, e] : index) {
+        const Rec r{key, e.size, e.notes, 0};
+        o.insert(o.end(), (const uint8_t*)&r, (const uint8_t*)&r + sizeof r);
+        o.insert(o.end(), (const uint8_t*)&e.at, (const uint8_t*)&e.at + 8);
+    }
+    const std::string tmp = idx_path() + ".tmp";
+    if (FILE* f = fopen(tmp.c_str(), "wb")) {
+        put(f, o.data(), o.size());
+        fclose(f);
+        MoveFileExA(tmp.c_str(), idx_path().c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+}
+/// The pack opened once (needs the device: its stamp and the driver's cache UUID): its index read in, the file opened to read and
+/// to add to. A pack of another stamp or driver is started over. Returns whether it has anything for play
+bool open() {
+    std::lock_guard lk(mu);
+    if (opened) return usable;
+    opened = true;
+    if (!on()) return false;
+    const Head now = head_now();
+    bool good = false;
+    if (FILE* f = fopen(idx_path().c_str(), "rb")) {
+        Head h{};
+        if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(&h, &now, sizeof h)) {
+            good = true;
+            Rec r;
+            uint64_t at = 0;
+            while (fread(&r, sizeof r, 1, f) == 1 && fread(&at, 8, 1, f) == 1) index[r.key] = Entry{at, r.size, r.notes};
+        }
+        fclose(f);
+    }
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path(), ec);
+    if (good && (ec || size < sizeof(Head))) good = false, index.clear();
+    if (good) {
+        for (auto it = index.begin(); it != index.end();)   // (an entry past the file's end: the file was cut, the entry goes)
+            it = it->second.at + it->second.size > (uint64_t)size ? index.erase(it) : std::next(it);
+        out = fopen(path().c_str(), "ab");
+        end = written_end = (int64_t)size;
+    } else {
+        index.clear();
+        out = fopen(path().c_str(), "wb");
+        if (out) put(out, &now, sizeof now);
+        end = written_end = (int64_t)sizeof now;
+        remove(idx_path().c_str());
+    }
+    in = out ? fopen(path().c_str(), "rb") : nullptr;
+    usable = in != nullptr && !index.empty();
+    logf("vk: pipeline pack (RX_VK_PIPELINE_PACK): %zu programs' graphics pipelines in %s (%lld MB)%s", index.size(),
+         path().c_str(), (long long)(end >> 20), good ? "" : ", started over (none, or another translator's or driver's)");
+    return usable;
+}
+bool has_any() {
+    if (!open()) return false;
+    std::lock_guard lk(mu);
+    return !index.empty();
+}
+/// The notes a program's part was built for (0: none in the pack)
+uint32_t notes_of(uint64_t key) {
+    std::lock_guard lk(mu);
+    const auto it = index.find(key);
+    return it == index.end() ? 0 : it->second.notes;
+}
+bool read(uint64_t key, std::vector<uint8_t>& data) {
+    Entry e;
+    {
+        std::lock_guard lk(mu);
+        const auto it = index.find(key);
+        if (it == index.end() || !in) return false;
+        e = it->second;
+        if ((int64_t)(e.at + e.size) > written_end) flush_locked();   // (a part this run made, still held)
+    }
+    data.resize((size_t)e.size);
+#ifdef __PROSPERO__
+    size_t got = 0;
+    const int fd = fileno(in);
+    while (got < e.size) {
+        const ssize_t r = ::pread(fd, data.data() + got, e.size - got, (off_t)(e.at + got));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    return got == e.size;
+#else
+    std::lock_guard lk(mu);
+    return _fseeki64(in, (int64_t)e.at, SEEK_SET) == 0 && fread(data.data(), 1, data.size(), in) == data.size();
+#endif
+}
+/// A program's part, built: its cache's data onto the pack, the index told (written out at index_save)
+void add(uint64_t key, VkPipelineCache cache, uint32_t notes) {
+    size_t n = 0;
+    if (vkGetPipelineCacheData(dev.device, cache, &n, nullptr) != VK_SUCCESS || !n) return;
+    std::vector<uint8_t> data(n);
+    if (vkGetPipelineCacheData(dev.device, cache, &n, data.data()) != VK_SUCCESS) return;
+    data.resize(n);
+    std::lock_guard lk(mu);
+    if (!out) return;
+    const Rec r{key, (uint64_t)n, notes, 0};
+    held.insert(held.end(), (const uint8_t*)&r, (const uint8_t*)&r + sizeof r);
+    const uint64_t at = (uint64_t)end + sizeof r;
+    held.insert(held.end(), data.begin(), data.end());
+    end += (int64_t)(sizeof r + n);
+    index[key] = Entry{at, (uint64_t)n, notes};
+    if (held.size() >= (8u << 20)) flush_locked();
+}
+void save() {
+    std::lock_guard lk(mu);
+    if (!out) return;
+    flush_locked();
+    index_write_locked();
+}
+}  // namespace pack
+// (PK1) the program whose graphics pipeline build_graphics is making (play: its part of the pack is leased), and the program's own
+// cache a preparation is filling (precompile_warm)
+thread_local uint64_t pack_prog = 0;
+thread_local VkPipelineCache pack_build_cache = VK_NULL_HANDLE;
+/// (PK1) The cache a graphics pipeline of pack_prog is asked of in play: that program's part of the pack, kept for the thread until it
+/// asks for another program's; pcache where the pack has none
+VkPipelineCache pack_start_cache() {
+    struct Lease {
+        uint64_t key = 0;
+        VkPipelineCache cache = VK_NULL_HANDLE;
+    };
+    static thread_local Lease lease;
+    if (!pack_prog || !pack::on() || !pack::has_any()) return pcache;
+    if (lease.key == pack_prog && lease.cache) return lease.cache;
+    if (lease.cache) vkDestroyPipelineCache(dev.device, lease.cache, nullptr), lease.cache = VK_NULL_HANDLE;
+    lease.key = pack_prog;
+    static thread_local std::vector<uint8_t> data;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!pack::read(pack_prog, data)) return pcache;
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = data.size(), ci.pInitialData = data.data();
+    if (vkCreatePipelineCache(dev.device, &ci, nullptr, &lease.cache) != VK_SUCCESS) lease.cache = VK_NULL_HANDLE;
+    // (how much the leases cost: a part read and its cache made, every 1,000)
+    static std::atomic<int64_t> leased{0}, lease_ns{0}, lease_bytes{0};
+    lease_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                       std::memory_order_relaxed);
+    lease_bytes.fetch_add((int64_t)data.size(), std::memory_order_relaxed);
+    if (const int64_t n = leased.fetch_add(1, std::memory_order_relaxed) + 1; n % 1000 == 0)
+        logf("vk: pipeline pack: %lld programs' parts read in (%.1f MB, %.1f ms each on average)", (long long)n,
+             lease_bytes.load() / 1048576.0, lease_ns.load() / 1e6 / (double)n);
+    return lease.cache ? lease.cache : pcache;
+}
 std::atomic<int64_t> pcache_built_since_save{0};
 // (longshot) The size of the cache's data when it was last read or written. The count above takes in every pipeline made
 // with the cache, the ones it already held too: the precompile's ~13,000 at each start, all found in the cache, made the
@@ -935,8 +1163,11 @@ void play_cache_save(int wait_ms = -1, bool queue = true) {
 thread_local bool ask_start_first = false;
 template <class CI>
 VkResult create_cached(VkResult (*create)(VkPipelineCache, const CI*, VkPipeline*), const CI* ci, VkPipeline* pl) {
+    // (PK1: a graphics pipeline of a program in the pipeline pack is asked of that program's part, not of pcache)
+    VkPipelineCache start = pcache;
+    if constexpr (std::is_same_v<CI, VkGraphicsPipelineCreateInfo>) start = pack_start_cache();
     PlayCache* g = play_cache.load();
-    if (!g) return create(pcache, ci, pl);
+    if (!g) return create(start, ci, pl);
     const bool ask_only = (ci->flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) != 0;
     // (counted in before it is used: a save takes the generation away only once its count is back to 0)
     for (;;) {
@@ -949,7 +1180,7 @@ VkResult create_cached(VkResult (*create)(VkPipelineCache, const CI*, VkPipeline
     ask.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     static const bool start_first = !getenv("RX_VK_PLAY_ASK_START_FIRST") || atoi(getenv("RX_VK_PLAY_ASK_START_FIRST")) != 0;
     if (ask_only && (((ci->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) && start_first) || ask_start_first)) {
-        VkResult r = create(pcache, &ask, pl);
+        VkResult r = create(start, &ask, pl);
         // (the census counts what a draw or dispatch asked for; what the load at create asks for is counted there)
         if (r == VK_SUCCESS) {
             g->from_start.fetch_add(1), census.play_from_start += !ask_start_first, use_counters.made_how = 2;
@@ -967,7 +1198,7 @@ VkResult create_cached(VkResult (*create)(VkPipelineCache, const CI*, VkPipeline
         g->built.fetch_add(1), g->from_driver.fetch_add(1), census.play_from_driver++, use_counters.made_how = 1;
     } else if (r == VK_PIPELINE_COMPILE_REQUIRED) {
         *pl = VK_NULL_HANDLE;
-        r = create(pcache, &ask, pl);
+        r = create(start, &ask, pl);
         if (r == VK_SUCCESS) {
             g->from_start.fetch_add(1), census.play_from_start++, use_counters.made_how = 2;
         } else if (r == VK_PIPELINE_COMPILE_REQUIRED && !ask_only) {
@@ -1007,6 +1238,8 @@ bool pcache_drop_stale() {
     }();
     return dropped;
 }
+std::string pipe_notes_path();         // (below: the notes; PK1 asks for them here)
+std::string precompile_built_path();
 void pcache_init() {
     if (pcache) return;
     const std::string dir = pcache_dir = cache_path("");   // (the game folder's cache/, with its separator: vk_paths.h)
@@ -1016,7 +1249,22 @@ void pcache_init() {
     const bool off = pcache_load_off();
     pcache_no_save = off;
     pcache_drop_stale();   // (before the files are read)
-    auto data = off ? PipelineCacheFile{} : pcache_file_read(pcache_path);
+    // (PK1) The pipeline pack on and empty while notes exist: this folder's pipeline cache holds every noted graphics pipeline, the
+    // memory the pack is there to save. It is not read: the start's warm pass (precompile_run, its marker taken away) builds the
+    // pack and the compute pipelines, and the pipeline cache it then saves holds those alone
+    bool pack_migrates = false;
+    if (pack::on() && !off) {
+        pack::open();
+        if (!pack::has_any()) {
+            if (FILE* f = fopen(pipe_notes_path().c_str(), "rb")) {
+                fclose(f);
+                pack_migrates = true;
+                remove(precompile_built_path().c_str());
+                logf("vk: pipeline pack: none yet beside the notes: the pipeline cache starts empty and this start builds the pack");
+            }
+        }
+    }
+    auto data = off || pack_migrates ? PipelineCacheFile{} : pcache_file_read(pcache_path);
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
     ci.pInitialData = data.empty() ? nullptr : data.data();
@@ -1095,6 +1343,7 @@ std::mutex kept_ready_mu;
 struct KeptPipe {
     VkPipeline pl = VK_NULL_HANDLE;
     const Program* prog = nullptr;
+    int64_t made = 0;   // (KR1: steady ns when it was kept; kept_ready_sweep)
 };
 std::unordered_map<uint64_t, KeptPipe> kept_ready;
 std::atomic<size_t> kept_ready_n{0};
@@ -1469,6 +1718,43 @@ uint64_t program_wm_sig(const Program& p) {
 std::mutex note_mu;
 FILE* note_file = nullptr;
 std::unordered_set<uint64_t> noted;   // (a pipeline once in the file, however many runs meet it)
+// (NB1, 2026-11-25) A preparation's notes, held: each was written and flushed alone, a write call into the title folder of ~60 ms
+// on the console. The shipped list's 22,000 new notes kept a start in its silent "state list" step for 7 minutes with the CPU at
+// 5% (23.log, 25.log). While notes_holding they collect here and go out in one write() at notes_flush, before anything reads the
+// file (pipe_notes_read and the references' walks below) and at the state list's end. RX_VK_DISK_STDIO=1: written one by one
+std::vector<uint8_t> notes_held;
+bool notes_holding = false;   // (note_mu)
+/// (note_mu held) what is held, onto the notes file's end in as few write calls as the system takes
+void notes_flush_locked() {
+    if (notes_held.empty() || !note_file) return notes_held.clear();
+    size_t off = 0;
+    bool ok = fflush(note_file) == 0;
+#ifdef __PROSPERO__
+    if (ok) {
+        const int fd = fileno(note_file);
+        while (off < notes_held.size()) {
+            const ssize_t w = ::write(fd, notes_held.data() + off, notes_held.size() - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
+    }
+#endif
+    if (off < notes_held.size()) fwrite(notes_held.data() + off, 1, notes_held.size() - off, note_file);
+    fflush(note_file);
+    (void)ok;
+    notes_held.clear();
+}
+void notes_flush() {
+    std::lock_guard lk(note_mu);
+    notes_flush_locked();
+}
+void notes_hold(bool on) {
+    static const bool stdio = getenv("RX_VK_DISK_STDIO") && atoi(getenv("RX_VK_DISK_STDIO")) != 0;
+    std::lock_guard lk(note_mu);
+    notes_holding = on && !stdio;
+    if (!on) notes_flush_locked();
+}
 std::string pipe_notes_path() { return cache_path("longshot_pipelines.bin"); }
 /// (longshot) longshot_pipelines.bin.built: a precompile that got to its end built every note there was into the pipeline cache
 /// (its stamp, and how many). RX_VK_LOAD=create loads pipelines from the caches alone, and only once this says they are there.
@@ -1523,6 +1809,7 @@ bool note_sane(PipeNote& n) {
 }
 std::vector<std::unique_ptr<PipeNote>> pipe_notes_read() {
     std::vector<std::unique_ptr<PipeNote>> notes;
+    notes_flush();   // (NB1: held notes into the file first)
     if (FILE* f = fopen(pipe_notes_path().c_str(), "rb")) {
         uint64_t head[2] = {0, 0};
         if (fread(head, 8, 2, f) == 2 && head[0] == program_cache_stamp() && head[1] == sizeof(PipeNote)) {
@@ -1593,7 +1880,12 @@ bool pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targ
     std::lock_guard lk(note_mu);
     if (!note_file) notes_open_locked(nullptr);
     if (!note_file || !noted.insert(key).second) return false;
-    fwrite(rec.get(), sizeof(PipeNote), 1, note_file), fflush(note_file);
+    if (notes_holding) {   // (NB1: a preparation's, out at notes_flush)
+        notes_held.insert(notes_held.end(), (const uint8_t*)rec.get(), (const uint8_t*)rec.get() + sizeof(PipeNote));
+        if (notes_held.size() >= (8u << 20)) notes_flush_locked();
+    } else {
+        fwrite(rec.get(), sizeof(PipeNote), 1, note_file), fflush(note_file);
+    }
     return true;
 }
 
@@ -1738,6 +2030,71 @@ std::string state_list_path(const char* name) {
     // (the shipped list is the build's, beside the game; the ones play adds to are this PC's, in the game folder's cache/)
     return strstr(name, "_shipped") ? game_folder_path() + name : cache_path(name);
 }
+// ---- (SL1, 2026-11-25) Whether the shipped pipeline list is new or replaced since the last preparation that read it: the console's
+// start then runs the state lists' refresh (prepare_run refresh_states: only the programs not kept yet translated, only the
+// pipelines not noted before noted, and precompile_run builds those), so an install that already has a cache builds what the list
+// adds and nothing else. A fresh install prepares everything anyway (the full preparation reads the lists) and is marked after it.
+// Told by the list's size, time and bytes and the program cache's stamp, kept in cache/longshot_shipped_prepared.bin ----
+namespace {
+std::string shipped_mark_path() { return cache_path("longshot_shipped_prepared.bin"); }
+std::string shipped_list_path() { return state_list_path("longshot_pipeline_states_shipped.bin"); }
+/// [the program cache's stamp, size, time, content hash]; the hash only when asked (a new build's copy has a new time, the same bytes)
+bool shipped_now(uint64_t out[4], bool hash) {
+    std::error_code ec;
+    const std::filesystem::path p(shipped_list_path());
+    const auto size = std::filesystem::file_size(p, ec);
+    if (ec) return false;
+    const auto when = std::filesystem::last_write_time(p, ec);
+    if (ec) return false;
+    out[0] = program_cache_stamp(), out[1] = (uint64_t)size, out[2] = (uint64_t)when.time_since_epoch().count(), out[3] = 0;
+    if (hash) {
+        FILE* f = fopen(shipped_list_path().c_str(), "rb");
+        if (!f) return false;
+        uint64_t h = 0xCBF29CE484222325ull;
+        static thread_local std::vector<uint8_t> b(1 << 20);
+        for (size_t n; (n = fread(b.data(), 1, b.size(), f)) > 0;)
+            for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+        fclose(f);
+        out[3] = h;
+    }
+    return true;
+}
+bool shipped_kept(uint64_t kept[4]) {
+    FILE* f = fopen(shipped_mark_path().c_str(), "rb");
+    if (!f) return false;
+    const bool ok = fread(kept, 8, 4, f) == 4;
+    fclose(f);
+    return ok;
+}
+void shipped_write(const uint64_t v[4]) {
+    if (FILE* f = fopen(shipped_mark_path().c_str(), "wb")) fwrite(v, 8, 4, f), fclose(f);
+}
+}  // namespace
+}  // namespace (the file's unnamed one, left for these two: vk_main.cpp links to them)
+bool shipped_states_changed() {
+    static int known = -1;   // (once a start: the console's start asks before the instance (preparation_ahead) and again after)
+    if (known >= 0) return known != 0;
+    known = 0;
+    uint64_t now[4], kept[4];
+    if (!shipped_now(now, false)) return false;   // (no list: nothing to refresh)
+    if (shipped_kept(kept) && kept[0] == now[0] && kept[1] == now[1]) {
+        if (kept[2] == now[2]) return false;
+        // (the same size, another time: a new build's copy of the same list, most likely. The bytes decide; the time is kept)
+        if (shipped_now(now, true) && now[3] == kept[3]) {
+            shipped_write(now);
+            return false;
+        }
+    }
+    logf("vk: the shipped pipeline list is new or replaced since the last preparation (%llu KB): the pipelines it adds are made "
+         "now, the rest is kept", (unsigned long long)(now[1] >> 10));
+    known = 1;
+    return true;
+}
+void shipped_states_mark() {
+    uint64_t now[4];
+    if (shipped_now(now, true)) shipped_write(now);
+}
+namespace {   // (the file's unnamed namespace again)
 template <class R>
 uint64_t state_hash(const R& r) {
     uint64_t h = 0xCBF29CE484222325ull;
@@ -1983,8 +2340,26 @@ std::string state_list_bytes(bool* present) {
 }
 /// Every pipeline of the state lists (the player's own and the shipped one): its program translated
 /// when the program cache lacks it, then noted in longshot_pipelines.bin for precompile_run to build. RX_VK_NO_STATE_LIST=1: off
+// ---- (LP1, 2026-11-25) The state list's own count, for the start-up screen and the log: it ran with none in a full preparation, and
+// its reading and noting parts had none at all (the screen stood at "N / N shaders" for minutes, 23.log, 25.log). Its three
+// parts: 1 the list's programs translated, 2 the programs read in from the program cache, 3 the pipelines noted ----
+std::atomic<int> list_phase{0};
+std::atomic<size_t> list_done{0}, list_total{0};
+}  // namespace (the file's unnamed one, left for this: vk_main.cpp links to it)
+void state_list_progress(int* phase, size_t* done, size_t* total) {
+    *phase = list_phase.load(std::memory_order_relaxed);
+    *done = list_done.load(std::memory_order_relaxed), *total = list_total.load(std::memory_order_relaxed);
+}
+namespace {   // (the file's unnamed namespace again)
 void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_seed = false) {
     if (env_on("RX_VK_NO_STATE_LIST")) return;
+    struct NotesHeld {   // (NB1: the notes this makes go out together, at the end, whichever way it returns)
+        NotesHeld() { notes_hold(true); }
+        ~NotesHeld() { notes_hold(false); }
+    } notes_held_here;
+    struct ListCount {   // (LP1: the count back to none, whichever way it returns)
+        ~ListCount() { list_phase.store(0), list_done.store(0), list_total.store(0); }
+    } list_count_here;
     remove((pipe_notes_path().substr(0, pipe_notes_path().find_last_of("\\/") + 1) + "longshot_load_start.txt").c_str());
     remove((pipe_notes_path().substr(0, pipe_notes_path().find_last_of("\\/") + 1) + "longshot_load_start.txt.waited").c_str());   // (a preparation: loads at create are tried again, load_default.h load_fallback_path)
     const auto t0 = std::chrono::steady_clock::now();
@@ -2020,11 +2395,13 @@ void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_s
     size_t done = 0, total = want.size() + recs.size();
     std::mutex progress_mu;
     const auto report_done = [&] {
+        list_done.fetch_add(1, std::memory_order_relaxed);   // (LP1)
         if (progress) {
             std::lock_guard<std::mutex> lock(progress_mu);
             progress(++done, total);
         }
     };
+    list_total.store(want.size()), list_done.store(0), list_phase.store(1);   // (LP1: the programs to translate)
     if (progress) progress(0, total);
     std::atomic<size_t> next{0}, made{0}, missing{0};
     const auto worker = [&] {
@@ -2048,14 +2425,18 @@ void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_s
         }
     };
     std::vector<std::thread> threads;
-    for (unsigned i = 0; i < std::clamp(half_cpus(), 1u, 32u); i++) threads.emplace_back(worker);
+    for (unsigned i = 0; i < std::clamp(prepare_cpus(), 1u, 32u); i++) threads.emplace_back(worker);
     for (std::thread& t : threads) t.join();
     // then each pipeline, noted as a draw would note it
     std::unordered_set<uint64_t> keys;
     for (const Want& w : want)
         if (w.key) keys.insert(w.key);
     // (these keys only: the kept compute programs stay on disk for precompile_run, which builds their pipelines)
-    program_cache_load_some(keys, [](Program& p) { ensure_layout(p); }, false);
+    list_total.store(keys.size()), list_done.store(0), list_phase.store(2);   // (LP1: the programs read in)
+    program_cache_load_some(keys, [](Program& p) {
+        ensure_layout(p);
+        list_done.fetch_add(1, std::memory_order_relaxed);
+    }, false);
     // the variants made by other textures (the seed's are for nothing bound): translated with the answers the game's gave
     // (a record with variant 0 and no answers or questions stands for the variant nothing bound makes: a list converted from records
     // that hold no texture answers has those; a program without textures has variant 0 already, and is found as it is)
@@ -2102,14 +2483,16 @@ void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_s
         }
     };
     threads.clear();
-    for (unsigned i = 0; i < std::clamp(half_cpus(), 1u, 32u); i++) threads.emplace_back(variant_worker);
+    for (unsigned i = 0; i < std::clamp(prepare_cpus(), 1u, 32u); i++) threads.emplace_back(variant_worker);
     for (std::thread& t : threads) t.join();
     std::unordered_map<uint64_t, const Program*> plain_of;   // (by program key: the variant nothing bound makes)
     for (size_t i = 0; i < variant_of.size(); i++)
         if (made_plain[i]) plain_of.emplace(want[rec_program[variant_of[i]]].key, made_plain[i]);
     size_t noted_n = 0, no_variant = 0, noted_mesh = 0, noted_fallback = 0, noted_plain = 0, added = 0;
     auto s = std::make_unique<NvnState>();
+    list_total.store(recs.size()), list_done.store(0), list_phase.store(3);   // (LP1: the pipelines noted)
     for (size_t i = 0; i < recs.size(); i++) {
+        list_done.store(i, std::memory_order_relaxed);
         const StateRec& r = recs[i];
         const uint64_t key = want[rec_program[i]].key;
         if (!key) continue;
@@ -2712,8 +3095,16 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     // build meets the gate busy as on AMD, where the gate is serial (RX_VK_DRIVER_FAULTS=2 makes it so on every driver)
     if (slow_full_build && test_slow_ms() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(test_slow_ms()));
     // (longshot) a quick build into no cache: an unoptimized pipeline saved would be what a later run's full build is answered with
-    const VkPipelineCache cache = quick_build ? VK_NULL_HANDLE
-                                  : lib_cached || (part < 0 && !driver_cache_only) ? pcache : driver_ask_cache;
+    VkPipelineCache cache = quick_build ? VK_NULL_HANDLE
+                            : lib_cached || (part < 0 && !driver_cache_only) ? pcache : driver_ask_cache;
+    // (PK1: a preparation filling a program's own cache builds into it; in play the pack's part is asked through pcache's path,
+    // create_cached, for this program)
+    if (cache == pcache && part < 0 && pack_build_cache) cache = pack_build_cache;
+    struct PackProg {
+        uint64_t was;
+        explicit PackProg(uint64_t key) : was(pack_prog) { pack_prog = key; }
+        ~PackProg() { pack_prog = was; }
+    } pack_prog_here(part < 0 ? p.key : 0);
     VkResult r = graphics_with(cache, &ci, &pl);
     // The AMD Windows compiler can reject ordinary graphics pipelines with its optimizer on. (A fault caught in it is kDriverFault
     // now, VK_ERROR_UNKNOWN before: the retry stays for both, under the gate)
@@ -6007,12 +6398,65 @@ uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, 
 /// (longshot #1763, a3565ac5: only its part ends) whether this recording thread has a render pass open (vk_replay.cpp maybe_split)
 bool draw_pass_open() { return pass().open; }
 
+// ---- (CM1, 2026-11-25) RX_VK_CUBEMAP_EVERY=N: the reflection cube's faces drawn on every Nth turn only ----
+// OoT repaints one 128x128 face of a reflection cube a frame (two cubes in turn, six faces each: a round is 12 frames), drawing
+// the scene around the camera into it again: 400-500 draws a frame in the daytime Market, 60-160 in the field (newest-logs 11
+// and 12, RX_VK_PASS_TRACE). With N=2 a face is drawn every other time its turn comes (about every 0.8 s instead of 0.4 s at
+// 30 fps) and keeps its last picture in between: the draws and clears of a skipped turn are left out. A face's first turn, and
+// the first after its texture is made again, is always drawn (no black faces after a load). Told by the target: one colour
+// target, 128x128 at level 0, with depth, in a texture of 6 or more layers. 3 by default since 1.2.0 (0 or 1: off)
+static std::atomic<int64_t> cube_turns_drawn{0}, cube_turns_left{0}, cube_draws_left{0};
+static bool cubemap_face_skipped(const Targets& at) {
+    static const int every = [] {
+        const char* e = getenv("RX_VK_CUBEMAP_EVERY");
+        const int v = e ? std::max(1, atoi(e)) : 3;   // (3 by default since 1.2.0; RX_VK_CUBEMAP_EVERY=1: every turn, as before)
+        if (v > 1) logf("vk: the reflection cube's faces drawn on every %d. turn (RX_VK_CUBEMAP_EVERY)", v);
+        return v;
+    }();
+    if (every <= 1) return false;
+    if (at.n != 1 || !at.depth || at.width != 128 || at.height != 128 || !at.color[0] || at.color_level[0] != 0 ||
+        at.color[0]->layers < 6)
+        return false;
+    struct Face { const Texture* tex = nullptr; uint64_t frame = ~0ull, turns = 0; bool skip = false; };
+    static std::mutex mu;
+    static std::unordered_map<uint64_t, Face> faces;
+    const uint64_t key = at.color[0]->gpu * 64 + at.color_layer[0], frame = texture_frame_no();
+    std::lock_guard lk(mu);
+    if (faces.size() > 512) faces.clear();
+    Face& f = faces[key];
+    if (f.tex != at.color[0]) f = Face{}, f.tex = at.color[0];
+    // (CM1b, 2026-11-25) After a load the cube still shows the area before it (the field's bright sky inside Kokiri's dark woods):
+    // with every Nth turn that took up to ~1.2 s to go, the shiny surfaces lit by the old picture, a flash at area changes (the
+    // user's video, 32.log). So every turn is drawn for 90 frames (~3 s at 30) after a frame of fewer than 250 draws (a load, a
+    // menu, a black transition: as the texture budget's pause frames, RX_VK_EVICT_PAUSE_DRAWS). Told from the draws between
+    // two looks at the cube, per frame
+    static uint64_t seen_frame = 0, busy_since = 0;
+    static int64_t seen_draws = 0;
+    if (frame != seen_frame) {
+        const int64_t per_frame = seen_frame && frame > seen_frame ? (st_draws - seen_draws) / (int64_t)(frame - seen_frame) : 0;
+        if (!seen_frame || per_frame < 250) busy_since = frame;   // (a quiet frame: what follows is a new picture)
+        seen_frame = frame, seen_draws = st_draws;
+    }
+    const bool settling = frame - busy_since < 90;
+    if (f.frame != frame) {
+        f.frame = frame;
+        f.skip = !settling && (f.turns++ % (uint64_t)every) != 0;
+        (f.skip ? cube_turns_left : cube_turns_drawn).fetch_add(1);
+        const int64_t total = cube_turns_drawn.load() + cube_turns_left.load();
+        if (total % 3000 == 0)
+            logf("vk: reflection cube faces: %lld turns drawn, %lld left out, %lld draws left out (RX_VK_CUBEMAP_EVERY=%d)",
+                 (long long)cube_turns_drawn.load(), (long long)cube_turns_left.load(), (long long)cube_draws_left.load(), every);
+    }
+    return f.skip;
+}
+
 void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float rgba[4], uint32_t mask) {
     ParLock lk;
     mask &= 0xF;
     if (!mask) return;
     const Targets at = targets(s);
     if (index < 0 || index >= at.n || !at.color_view[index]) return;
+    if (cubemap_face_skipped(at)) return;   // (CM1)
     clear_after_draws(cmd);
     begin_pass(cmd, at);
     const uint32_t lw = at.width, lh = at.height;
@@ -6050,6 +6494,7 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
     ParLock lk;
     const Targets at = targets(s);
     if (!at.depth) return;
+    if (cubemap_face_skipped(at)) return;   // (CM1)
     VkImageAspectFlags aspect = 0;
     if (depth_mask && depth_aspect(at.depth_format)) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (stencil_mask && has_stencil(at.depth_format)) aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -8199,6 +8644,10 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     const Targets at = bare_targets(s, targets(s));
     if (!at.width || !at.height) SKIP_HERE();
+    if (cubemap_face_skipped(at)) {   // (CM1)
+        cube_draws_left.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     // (longshot) the scene's camera and depth for the temporal upscalers: NVIDIA DLSS and AMD FSR 4 (vk_temporal.cpp) and AMD
     // FSR 3.1 (vk_fsr3_inputs.cpp). The vertex stage's uniform buffer 3 (NVN's binding 0)
     if (at.n && at.color[0] && at.depth) {
@@ -9909,6 +10358,7 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
 /// background: in play, behind the game: a few workers at idle priority, translation only (the driver's part is left to first use:
 /// its compiler crashing in here would take the game with it)
 /// refresh_states: Builder preparation also imports state lists when the seed is already prepared
+void program_cache_flush();   // (vk_progcache.cpp: what a preparation holds, out to the file; PW1b)
 bool prepare_run(void (*progress)(size_t done, size_t total), bool background, bool refresh_states) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::string path = prepared_path();
@@ -10028,6 +10478,9 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background, b
             const size_t k = order[i / 3];
             if (seed_is_compute(k)) {   // (longshot) a compute program with each of its texture variants, each warmed
                 if (i % 3 == 0) {
+                    // (PW1b: seed_compute reads the program's kept variants straight from the file (vk_shader.cpp, in the
+                    // translator stamp, so not changed there): what a preparation holds goes out first)
+                    program_cache_flush();
                     const SeedVariants v = seed_compute(k, 64, warm_compute);
                     made += v.variants != 0, variants += v.variants, asking += v.variants > 1, capped += v.capped && v.variants;
                 }
@@ -10135,6 +10588,7 @@ void prepare_progress_log(const char* what, size_t done, size_t total, std::chro
 /// again at the next one (the close puts the file back as the start found it, crash_markers.h), and after two that crashed in it
 /// (or were killed), the notes are taken as they are (what a cache then lacks is made at its first draw, as on an install that
 /// was never prepared)
+bool precompile_warmed_now = false;   // (PK1: this start built pipelines in the warm pass; vk_internal.h)
 void precompile_warm(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::string warming = precompile_built_path() + ".warming";
@@ -10167,6 +10621,7 @@ void precompile_warm(void (*progress)(size_t done, size_t total)) {
     const std::vector<uint64_t> computes = program_cache_compute_keys();
     const size_t all_n = total + computes.size();
     std::atomic<size_t> done{0}, built{0}, failed{0}, no_program{0};
+    std::atomic<size_t> packed_kept{0}, packed_made{0};   // (PK1)
     const std::string notes_path = pipe_notes_path();
     auto log_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     const unsigned threads = std::min(usable_cpus(), 16u);
@@ -10176,6 +10631,21 @@ void precompile_warm(void (*progress)(size_t done, size_t total)) {
         static thread_local std::unique_ptr<PipeNote> note = std::make_unique<PipeNote>();
         (void)off;
         const auto& list = by_prog.at(progs[i]);
+        // (PK1: with the pipeline pack, a program whose part was built for all these notes is left as it is; another's part is
+        // made in a cache of its own, started from its old part where there is one, so that only new notes compile)
+        VkPipelineCache own = VK_NULL_HANDLE;
+        if (pack::on()) {
+            if (pack::notes_of(progs[i]) >= list.size()) {
+                packed_kept++;
+                done += list.size();
+                return;
+            }
+            static thread_local std::vector<uint8_t> old;
+            VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            if (pack::read(progs[i], old)) pci.initialDataSize = old.size(), pci.pInitialData = old.data();
+            if (vkCreatePipelineCache(dev.device, &pci, nullptr, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
+            pack_build_cache = own;
+        }
         size_t found = 0;
         program_cache_borrow(progs[i], [&](Program& p) {
             ensure_layout(p);
@@ -10187,6 +10657,11 @@ void precompile_warm(void (*progress)(size_t done, size_t total)) {
                 (made ? built : failed)++;
             }
         });
+        if (own) {   // (PK1: the program's part into the pack; one cut short by a close is left out, to be made again)
+            pack_build_cache = VK_NULL_HANDLE;
+            if (found && !prepare_stopped()) pack::add(progs[i], own, (uint32_t)list.size()), packed_made++;
+            vkDestroyPipelineCache(dev.device, own, nullptr);
+        }
         no_program += list.size() - std::min(found, list.size());
         done += list.size();
     }, [] { return prepare_stopped(); }, [&](size_t) {
@@ -10220,6 +10695,12 @@ void precompile_warm(void (*progress)(size_t done, size_t total)) {
         prepare_progress_log("compute pipelines", computes_done.load(), computes.size(), c0, log_at);
     });
     const bool all = done == total && computes_done == computes.size();
+    if (pack::on()) {   // (PK1: the held parts and the index written, whether or not the run got to its end)
+        const auto k0 = std::chrono::steady_clock::now();
+        pack::save();
+        logf("vk: precompile: pipeline pack: %zu programs' parts made, %zu kept as they were, written in %.0f ms", packed_made.load(),
+             packed_kept.load(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - k0).count());
+    }
     static const bool prepare_only = env_on("LONGSHOT_PREPARE_ONLY");   // (a --prepare-shaders run: vk_main.cpp)
     if (all && !prepare_stopped()) {
         // (the whole cache written, a GB and more, with every pipeline counted: the start-up screen says so, not "a few seconds
@@ -10233,6 +10714,12 @@ void precompile_warm(void (*progress)(size_t done, size_t total)) {
         // (not by the preparation's own process: warm_bounded.h leaves_marker)
         if (warm_bounded::leaves_marker(prepare_only, all, prepare_stopped())) precompile_built_write(total);
         crash_markers::end(warming);
+        // (PK1: the console closes after a warm pass that made something, as after a preparation, for the heap. Not after one whose
+        // pipelines all came from the caches: the start after a preparation runs it again (the preparation leaves no marker) and
+        // closed once more for nothing (28.log: 0 pack parts made, its 9,701 compute pipelines cache hits, 18.7 s). Made: a pack
+        // part, or a pass of over 2 minutes)
+        precompile_warmed_now = packed_made.load() > 0 ||
+                                std::chrono::steady_clock::now() - t0 > std::chrono::minutes(2);
     }
     logf("vk: precompile: %zu noted pipelines of %zu programs and %zu compute pipelines of %zu compute programs built into the "
          "pipeline cache and let go (%zu and %zu not made, %zu whose program variant is not kept), on %u threads in %.1f s (the "
@@ -10329,9 +10816,15 @@ void precompile_at_create() {
 bool notes_lost_by_driver() {
     static const bool off = getenv("RX_VK_COLD_CHECK") && atoi(getenv("RX_VK_COLD_CHECK")) == 0;
     if (off || !dev.vk13.pipelineCreationCacheControl) return false;
+    // (PK1) With the pipeline pack the noted graphics pipelines are in files of ours that no driver update or eviction takes away,
+    // and the warm pass knows a program's part is whole by its count of notes: nothing for this check to find. Asked all the same,
+    // a sample of the pack found 19 of 48 (31.log) while play took ~7,800 of them from it and compiled 7 (29.log), and every start
+    // ran the warm pass again for nothing (16 s)
+    if (pack::on() && pack::has_any()) return false;
     constexpr size_t kSample = 48;
     const std::vector<NoteRef> refs = pipe_notes_refs();
     if (refs.size() < kSample) return false;
+    notes_flush();   // (NB1)
     FILE* f = fopen(pipe_notes_path().c_str(), "rb");
     if (!f) return false;
     const auto t0 = std::chrono::steady_clock::now();
@@ -10349,7 +10842,16 @@ bool notes_lost_by_driver() {
             fclose(f);
         }
     } restore{f, scratch};
-    driver_cache_only = true, driver_ask_cache = scratch;
+#ifdef __PROSPERO__
+    // (DC1/PK1: on the console the preparation runs with the driver's own disk cache off, so the noted pipelines are in ours (the
+    // pipeline cache, or a program's part of the pipeline pack) and never in the driver's: asked of the driver's alone, every start
+    // found them "lost" and ran the warm pass again (28.log, 2 of 48). Here they are asked as the load at create asks, of our caches
+    // without compiling: one missing there is really missing)
+    const bool ask_ours = true;
+#else
+    const bool ask_ours = false;
+#endif
+    if (!ask_ours) driver_cache_only = true, driver_ask_cache = scratch;
     size_t asked = 0, cold_n = 0;
     auto note = std::make_unique<PipeNote>();
     for (size_t i = 0; i < kSample; i++) {
@@ -10366,7 +10868,8 @@ bool notes_lost_by_driver() {
         });
     }
     const bool lost = asked >= kSample / 3 && cold_n * 2 > asked;
-    logf("vk: the driver's shader cache has %zu of %zu noted pipelines asked (a sample, in %.0f ms)%s", asked - cold_n, asked,
+    logf("vk: the %s has %zu of %zu noted pipelines asked (a sample, in %.0f ms)%s",
+         ask_ours ? "start's caches (the pipeline cache and pack)" : "driver's shader cache", asked - cold_n, asked,
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
          lost ? ": it lost them (a driver update, or evicted): they are built again before the title (RX_VK_COLD_CHECK=0: not asked)"
               : "");
@@ -12038,9 +12541,46 @@ bool precompile_covers_notes() {
     fclose(f);
     return ok;
 }
+/// (DC1, 2026-11-25) Whether this start is about to prepare: translate (no record, or the shader list's size or time not the
+/// record's), take in a shipped pipeline list not marked as prepared, or build notes the pipeline cache was not marked as holding.
+/// Asked by vk_main.cpp before the instance, when the driver reads whether to keep its own disk cache. Files only, and never the
+/// program cache's stamp: that one reads the device's features and is kept from its first call, so asked before the device it would
+/// be wrong for the whole run. A start this misses (a new translator alone) prepares with the driver's cache on, as before
+bool driver_cache_off_for_prepare = false;   // (DC1: vk_main.cpp sets it before the instance)
+bool preparation_ahead() {
+    PreparedFor had;
+    if (prepared_read(prepared_path(), &had) < 2) return true;
+    uint64_t size = 0;
+    int64_t when = 0;
+    if (seed_file_id(seed_path(), &size, &when) && (size != had.seed_size || when != had.seed_time)) return true;
+    {
+        std::error_code ec;
+        const std::filesystem::path list(state_list_path("longshot_pipeline_states_shipped.bin"));
+        const auto list_size = std::filesystem::file_size(list, ec);
+        if (!ec) {
+            uint64_t kept[4] = {0, 0, 0, 0};
+            FILE* f = fopen(cache_path("longshot_shipped_prepared.bin").c_str(), "rb");
+            const bool read = f && fread(kept, 8, 4, f) == 4;
+            if (f) fclose(f);
+            if (!read || kept[1] != (uint64_t)list_size) return true;   // (the same size, another time: a build's copy, most likely)
+        }
+    }
+    if (FILE* f = fopen(pipe_notes_path().c_str(), "rb")) {
+        fclose(f);
+        if (FILE* b = fopen(precompile_built_path().c_str(), "rb")) fclose(b);
+        else return true;
+        // (PK1: the pack asked for and not there yet: this start builds it, see pcache_init)
+        if (pack::on()) {
+            if (FILE* x = fopen(cache_path("longshot_vk_pipelines.pack.idx").c_str(), "rb")) fclose(x);
+            else return true;
+        }
+    }
+    return false;
+}
 std::string pipe_notes_file() { return pipe_notes_path(); }
 std::vector<NoteRef> pipe_notes_refs() {
     std::vector<NoteRef> refs;
+    notes_flush();   // (NB1)
     FILE* f = fopen(pipe_notes_path().c_str(), "rb");
     if (!f) return refs;
     uint64_t head[2] = {0, 0};
@@ -12109,15 +12649,50 @@ bool pipeline_keep_ready(uint64_t key, VkPipeline pl, const Program* prog) {
     if (!pl) return false;
     {
         std::lock_guard lk(kept_ready_mu);
-        auto [it, inserted] = kept_ready.try_emplace(key, KeptPipe{pl, prog});
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto [it, inserted] = kept_ready.try_emplace(key, KeptPipe{pl, prog, now});
         if (inserted || !it->second.pl) {
-            it->second = KeptPipe{pl, prog};
+            it->second = KeptPipe{pl, prog, now};
             kept_ready_n.store(kept_ready.size(), std::memory_order_release);
             return true;
         }
     }
     vkDestroyPipeline(dev.device, pl, nullptr);
     return false;
+}
+/// (KR1, 2026-11-25) The kept-ready pipelines no draw has taken in RX_VK_KEPT_READY_S seconds (0, the default: kept for good, as before)
+/// (36.log with 120: free memory median 1,522 MB against 1,083, but the let-go ones a draw asked for again were made on the replay
+/// thread, 12.7 ms a frame on average and up to 124, against 0.3: hitches to a few fps and slower transitions. Off until those
+/// are made off the replay thread)
+/// are let go, and their keys left as the loader's deferred ones: a draw that asks later takes the deferred path, which asks the
+/// caches without compiling (with the pipeline pack, that program's part: a hit in memory, a millisecond or two) instead of the
+/// worker's build. With the shipped pipeline list the load at a program's create call keeps every noted state of it ready, most of
+/// them never drawn by this player: 10,450-10,650 kept against ~3,800 before the list (24, 31, 33.log), the memory the textures
+/// then went without (33.log: free median 1,090 MB, textures made at 128 texels). Called once a present (status_tick), looks
+/// every 10 s
+void kept_ready_sweep() {
+    static const int64_t age_s = getenv("RX_VK_KEPT_READY_S") ? std::max(0, atoi(getenv("RX_VK_KEPT_READY_S"))) : 0;   // (off by default: 36.log, the rebuilds on the replay thread hitched)
+    if (!age_s || !kept_ready_n.load(std::memory_order_relaxed)) return;
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    static int64_t next = 0;
+    if (now < next) return;
+    next = now + 10'000'000'000ll;
+    std::vector<VkPipeline> gone;
+    size_t left = 0;
+    {
+        std::lock_guard lk(kept_ready_mu);
+        for (auto& [key, k] : kept_ready) {
+            if (!k.pl) continue;
+            if (now - k.made > age_s * 1'000'000'000ll) gone.push_back(k.pl), k.pl = VK_NULL_HANDLE;   // (deferred from now on)
+            else left++;
+        }
+    }
+    for (const VkPipeline pl : gone) vkDestroyPipeline(dev.device, pl, nullptr);
+    static int64_t total = 0;
+    total += (int64_t)gone.size();
+    if (!gone.empty())
+        logf("vk: kept-ready pipelines no draw took in %llds let go: %zu now, %lld in all, %zu still kept (RX_VK_KEPT_READY_S)",
+             (long long)age_s, gone.size(), (long long)total, left);
 }
 std::string load_fallback_path() {
     const std::string notes = pipe_notes_path();
@@ -12241,7 +12816,20 @@ void pipeline_cache_save(bool force) {
                     const std::string tmp = pcache_path + ".tmp";
                     pcache_save_outcome.what = Outcome::kWriteFailed, pcache_save_outcome.detail = pcache_path;
                     if (FILE* f = fopen(tmp.c_str(), "wb")) {
-                        const bool ok = fwrite(data.data(), 1, n, f) == n;
+                        // (PW1, 2026-11-25: one write() call, not the C library's 4 KB pieces of ~60 ms each into the title
+                        // folder: 84 MB took 230 s, 21.log. RX_VK_DISK_STDIO=1: fwrite as before)
+                        static const bool stdio = getenv("RX_VK_DISK_STDIO") && atoi(getenv("RX_VK_DISK_STDIO")) != 0;
+                        size_t off = 0;
+                        if (!stdio) {
+                            const int fd = fileno(f);
+                            while (off < n) {
+                                const ssize_t w = ::write(fd, data.data() + off, n - off);
+                                if (w < 0 && errno == EINTR) continue;
+                                if (w <= 0) break;
+                                off += (size_t)w;
+                            }
+                        }
+                        const bool ok = off == n || fwrite(data.data() + off, 1, n - off, f) == n - off;
                         fclose(f);
                         if (ok && MoveFileExA(tmp.c_str(), pcache_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
                             pcache_saved_size = n;

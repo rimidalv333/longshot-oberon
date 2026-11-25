@@ -14,6 +14,10 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #endif
+#ifdef __PROSPERO__
+#include <cerrno>
+#include <unistd.h>
+#endif
 #include <io.h>
 #include <algorithm>
 #include <array>
@@ -116,6 +120,37 @@ constexpr size_t kDiskHold = 8u << 20;
 constexpr size_t kDiskHold = 0;
 #endif
 size_t disk_held = 0;    // (bytes written to disk_out and not flushed: disk_mu)
+// (PW1, 2026-11-25) The hold above did not hold: the console's C library sends an fwrite out in pieces of its 4 KB buffer, a
+// write call each (~60 ms into the title folder), so not flushing kept at most 4 KB back. A first start's translation ran at
+// ~4 programs a second with the CPUs at 14% of one core for over two hours (newest-logs 21.log), every worker queued on disk_mu.
+// Now a preparation's records and index entries are kept here and go out at disk_flush_locked in one write() call each.
+// RX_VK_DISK_STDIO=1: through the stream as before
+std::vector<uint8_t> held_out, held_idx;
+bool disk_stdio() {
+    static const bool v = [] { const char* e = getenv("RX_VK_DISK_STDIO"); return e && atoi(e) != 0; }();
+    return v;
+}
+/// (disk_mu held) a held buffer onto its stream's end in as few write calls as the system takes (fflush first: the stream holds
+/// nothing then, and both files are opened to append or are new, so the descriptor's offset is the stream's)
+bool raw_append(FILE* f, std::vector<uint8_t>& b) {
+    if (!f || b.empty()) return true;
+    size_t off = 0;
+    bool ok = fflush(f) == 0;
+#ifdef __PROSPERO__
+    if (ok) {
+        const int fd = fileno(f);
+        while (off < b.size()) {
+            const ssize_t w = ::write(fd, b.data() + off, b.size() - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
+    }
+#endif
+    if (off < b.size()) ok = fwrite(b.data() + off, 1, b.size() - off, f) == b.size() - off && ok;   // (the rest, as before)
+    b.clear();
+    return ok;
+}
 int64_t disk_end = -1;   // (where the next record goes in the file: asked once, counted from then on)
 // (the records' heads, in the file's order, in longshot_programs.idx beside it: see disk_init)
 FILE* disk_idx = nullptr;
@@ -395,9 +430,15 @@ void get_info(Reader& r, Shader::Info& i) {
 }
 
 void disk_flush_locked() {   // (the records before their index entries: disk_mu held)
+    raw_append(disk_out, held_out);   // (PW1: what a preparation held, one write each)
+    raw_append(disk_idx, held_idx);
     if (disk_out) fflush(disk_out);
     if (disk_idx) fflush(disk_idx);
     disk_held = 0;
+}
+/// (PW1b) disk_mu held: what a preparation holds, out before a read of the file (a record still held is not in it)
+void program_cache_flush_locked() {
+    if (kDiskHold && disk_held) disk_flush_locked();
 }
 void program_cache_flush() {
     if (!kDiskHold) return;
@@ -446,6 +487,21 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     const int64_t at = disk_end;
     disk_end += (int64_t)head_size + (int64_t)stored;
     const bool hold = kDiskHold && disk_listing;   // (a preparation's: see kDiskHold)
+    if (hold && !disk_stdio()) {   // (PW1: into held_out / held_idx, written whole at disk_flush_locked)
+        const auto put_bytes = [](std::vector<uint8_t>& v, const void* d, size_t n) {
+            v.insert(v.end(), (const uint8_t*)d, (const uint8_t*)d + n);
+        };
+        put_bytes(held_out, head, 16);
+        if (disk_zstd) put_bytes(held_out, &kind, 4);
+        if (compressed_ok) {
+            const uint64_t usize = o.size();
+            put_bytes(held_out, &usize, 8);
+            put_bytes(held_out, compressed.data(), compressed.size());
+        } else {
+            put_bytes(held_out, o.data(), o.size());
+        }
+        if (disk_idx) idx_put(held_idx, p.key, stored, kind);
+    } else {
     fwrite(head, 8, 2, disk_out);
     if (disk_zstd) fwrite(&kind, 4, 1, disk_out);
     if (compressed_ok) {
@@ -461,6 +517,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
         idx_put(e, p.key, stored, kind);
         fwrite(e.data(), 1, e.size(), disk_idx);
         if (!hold) fflush(disk_idx);
+    }
     }
     if (hold && (disk_held += (size_t)stored + head_size) >= kDiskHold) disk_flush_locked();
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
@@ -796,6 +853,7 @@ std::mutex light_mu;
 /// A kept record's program without its code. nullptr: not a record to read this way (more than one stage, a head longer than
 /// kFront or a tail longer than kTailMost, one that does not read): it is read whole, as before
 std::unique_ptr<Program> program_cache_read_light(FILE* in, std::mutex* mu, uint64_t key, const DiskRecord& d) {
+    program_cache_flush();   // (PW1b: what a preparation holds goes out first: a held record is not in the file yet)
     // (the compressed cache, RX_VK_PROGRAM_CACHE_ZSTD: a record is one zstd frame behind a 20-byte head, and nothing in it has
     // a place of its own in the file. Not a record to read this way: the caller reads it whole, program_cache_read unpacks it)
     if (disk_zstd) return nullptr;
@@ -853,6 +911,7 @@ namespace {
 /// (in: a handle on the cache's file, used under mu when given) the code read and the module made. busy: Intel's compiler
 /// gate only tried (make_module); while another thread holds it, *busy is set, false comes back and the program is as it was
 bool complete_from(Program& p, FILE* in, std::mutex* mu, bool* busy = nullptr) {
+    program_cache_flush();   // (PW1b: what a preparation holds goes out first: a held record is not in the file yet)
     if (!p.code_words) return !p.failed;
     const int64_t code_at = p.code_at;
     const uint64_t words = p.code_words;
@@ -972,6 +1031,7 @@ std::vector<DiskRecord> program_cache_records(uint64_t key) {
     return it == disk_records.end() ? std::vector<DiskRecord>{} : it->second;
 }
 bool program_cache_variant(FILE* in, uint64_t key, const DiskRecord& d, uint64_t* variant) {
+    program_cache_flush();   // (PW1b: what a preparation holds goes out first: a held record is not in the file yet)
     if (disk_zstd) return false;   // (a compressed record's head is not read by its place: the caller takes the record whole)
     // (a record's head: its key and size, the kind word, then the answers, which are what its variant is the hash of)
     constexpr size_t kFront = 1024;
@@ -1032,6 +1092,7 @@ std::string program_cache_path() {
 /// game's programs stay on disk until a draw asks for one
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn, bool computes,
                                bool fallbacks) {
+    program_cache_flush();   // (PW1b: what a preparation holds goes out first: a held record is not in the file yet)
     disk_init();
     // (read and made on several threads, each with a handle of its own on the file: one after the other, the few hundred records
     // (about 200 MB) were a second or more of the start before the first pipeline was built, a CPU or the disk at a time)
@@ -1145,6 +1206,7 @@ bool program_modules_dropped(const Program& p) {
 }
 
 bool program_cache_complete_graphics(const Program& prog) {
+    program_cache_flush();   // (PW1b: what a preparation holds goes out first: a held record is not in the file yet)
     if (prog.failed) return false;
     if (!module_remake::any.load(std::memory_order_acquire)) return true;
     const module_remake::KeyVariant kv{prog.key, prog.variant};
@@ -1420,6 +1482,15 @@ bool segment_heap() {
 #endif
 }
 unsigned prepare_cpus() {
+    // (PT1, 2026-11-25) RX_VK_PREPARE_THREADS=<n>: the first part's workers, whatever the rule below says (at most 64). On the PS5
+    // the rule gives half of 16 = 8 of the 13 usable CPUs (20.log), and nothing else runs during the preparation. ProjectReLink
+    // v0.7.9.4 found the same (half the CPUs made a 4-thread PC's first start twice as long) and runs every CPU but one. Each
+    // worker more holds more memory at the peak (0.4-0.5 GB on PC: prepare_workers.h), so on PC this stays opt-in
+    if (const char* e = getenv("RX_VK_PREPARE_THREADS"); e && atoi(e) > 0) return std::min((unsigned)atoi(e), 64u);
+#ifdef __PROSPERO__
+    // (since 1.2.0: 12 on the console by default, every usable CPU but one; 27.log: the whole preparation at 12 in ~1 h 25 min)
+    return std::max(1u, std::min(12u, usable_cpus() > 1 ? usable_cpus() - 1 : 1u));
+#endif
     uint64_t avail_mb = 0;
 #ifdef _WIN32
     MEMORYSTATUSEX m{sizeof m};
