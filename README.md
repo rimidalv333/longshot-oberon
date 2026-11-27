@@ -516,7 +516,7 @@ Then copy `longshot_shaders.bin`, `prompts/` and the contents of `title/` into `
 
 **Rules for changes**
 - Don't change the *stamped* files (`gpu/vk/vk_shader.cpp`, `vk_bank.cpp`, `vk_state.h`, `gpu/vk/eden/`, `sirit/`,
-  `compat/`) unless you mean to. Any change to them makes every console translate all its shaders again. (THIS CAN TAKE ANOTHER COUPLE OF HOURS)
+  `compat/`) unless you mean to. Any change to them makes every console translate all its shaders again. (THIS CAN TAKE 1.5H AGAIN)
   The build prints the stamp.
 - Nothing that raises memory use goes in without a guard that backs off under the texture reserve.
 
