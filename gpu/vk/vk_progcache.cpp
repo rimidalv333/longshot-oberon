@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -38,6 +39,28 @@
 #include <vector>
 
 #include "zstd.h"
+namespace mkwvk {
+// (2026-11-26, HK1) RX_VK_HEAP_KEEP (on; =0 off): zstd's contexts kept by each thread, not made and freed by every
+// ZSTD_compress / ZSTD_decompress (a compress context at level 1-3 is ~0.5 MB, a decompress one ~160 KB). 47.log's heap churn:
+// ~510 MiB a run of 563 KB blocks made and freed by the stage packing alone, between the long-lived blocks of the programs
+// read, which leaves holes the heap keeps mapped (46.log: 180 -> 480 MiB mapped but free)
+bool heap_keep_on() {
+    static const bool v = [] { const char* e = getenv("RX_VK_HEAP_KEEP"); return !e || atoi(e) != 0;   /* (on since 49.log) */ }();
+    return v;
+}
+size_t zstd_compress_kept(void* dst, size_t cap, const void* src, size_t n, int level) {
+    if (!heap_keep_on()) return ZSTD_compress(dst, cap, src, n, level);
+    static thread_local ZSTD_CCtx* c = ZSTD_createCCtx();
+    if (!c) return ZSTD_compress(dst, cap, src, n, level);
+    return ZSTD_compressCCtx(c, dst, cap, src, n, level);
+}
+size_t zstd_decompress_kept(void* dst, size_t cap, const void* src, size_t n) {
+    if (!heap_keep_on()) return ZSTD_decompress(dst, cap, src, n);
+    static thread_local ZSTD_DCtx* d = ZSTD_createDCtx();
+    if (!d) return ZSTD_decompress(dst, cap, src, n);
+    return ZSTD_decompressDCtx(d, dst, cap, src, n);
+}
+}   // namespace mkwvk
 
 #include "shader_recompiler/shader_info.h"
 #include "longshot_env.h"
@@ -468,7 +491,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     bool compressed_ok = false;
     if (disk_zstd && o.size() >= 256) {
         compressed.resize(ZSTD_compressBound(o.size()));
-        const size_t n = ZSTD_compress(compressed.data(), compressed.size(), o.data(), o.size(), 3);
+        const size_t n = zstd_compress_kept(compressed.data(), compressed.size(), o.data(), o.size(), 3);   // (HK1)
         if (!ZSTD_isError(n) && n + 8 < o.size()) {
             compressed.resize(n);
             compressed_ok = true;
@@ -534,7 +557,7 @@ bool program_cache_payload(const uint8_t* stored, size_t stored_size, uint32_t k
     std::memcpy(&usize, stored, 8);
     if (usize < 4 || usize > (1ull << 31)) return false;
     plain.resize((size_t)usize);
-    const size_t n = ZSTD_decompress(plain.data(), plain.size(), stored + 8, stored_size - 8);
+    const size_t n = zstd_decompress_kept(plain.data(), plain.size(), stored + 8, stored_size - 8);   // (HK1)
     if (ZSTD_isError(n) || n != plain.size()) return false;
     *payload = plain.data();
     *payload_size = plain.size();
@@ -580,7 +603,7 @@ VkShaderModule lazy_pack(Stage& st, const std::vector<uint32_t>& spirv, uint64_t
     // after, left a hole in the heap between the long-lived blocks each time; klog_8: 1.93 GB mapped for 1.19 GB in use)
     static thread_local std::vector<uint8_t> scratch;
     scratch.resize(ZSTD_compressBound(spirv.size() * 4));
-    const size_t n = ZSTD_compress(scratch.data(), scratch.size(), spirv.data(), spirv.size() * 4, 1);
+    const size_t n = zstd_compress_kept(scratch.data(), scratch.size(), spirv.data(), spirv.size() * 4, 1);   // (HK1)
     if (ZSTD_isError(n)) return VK_NULL_HANDLE;
     auto p = std::make_shared<PackedSpirv>();
     p->words = spirv.size(), p->key = key;
@@ -593,8 +616,16 @@ VkShaderModule lazy_pack(Stage& st, const std::vector<uint32_t>& spirv, uint64_t
 /// A real module of a stand-in's SPIR-V (VK_NULL_HANDLE: not made)
 VkShaderModule lazy_make(VkShaderModule tagged) {
     const PackedSpirv* p = lazy_of(tagged);
-    std::vector<uint32_t> spirv(p->words);
-    const size_t got = ZSTD_decompress(spirv.data(), spirv.size() * 4, p->z.data(), p->z.size());
+    // (HK1: into a buffer this thread keeps, not one made for every module: radv's module is a copy)
+    static thread_local std::vector<uint32_t> kept;
+    std::vector<uint32_t> own;
+    std::vector<uint32_t>& spirv = heap_keep_on() ? kept : own;
+    spirv.resize(p->words);
+    struct Shrink {
+        std::vector<uint32_t>& v;
+        ~Shrink() { if (v.capacity() > (4u << 20)) std::vector<uint32_t>().swap(v); }
+    } shrink{spirv};
+    const size_t got = zstd_decompress_kept(spirv.data(), spirv.size() * 4, p->z.data(), p->z.size());
     if (ZSTD_isError(got) || got != spirv.size() * 4) return VK_NULL_HANDLE;
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = spirv.size() * 4, ci.pCode = spirv.data();
@@ -729,6 +760,89 @@ void lazy_modules_report() {
     logf("vk: heap report: lazy modules: %lld KB of SPIR-V kept as %lld KB packed, %lld modules made for builds",
          (long long)(lazy_plain_bytes.load() >> 10), (long long)(lazy_packed_bytes.load() >> 10), (long long)lazy_made.load());
 }
+// (2026-11-26, PC1) what the programs in memory hold on the heap, by member (an estimate from sizes and capacities): 42/43.log
+// showed ~450 MiB under the program records' reads, not named by any other report line
+std::atomic<int64_t> c1_before{0}, c1_after{0}, c1_trimmed{0};   // (PC1, c1_trim below)
+extern std::atomic<int64_t> info_before, info_after;   // (PC2, below)
+int64_t info_lists_bytes(const Shader::Info& i);
+void program_records_report() {
+    int64_t lists = 0, progs = 0, stages = 0, stage_vec = 0, c1 = 0, c1_max = 0, handles = 0, legacy = 0, spill = 0, other = 0;
+    {
+        std::lock_guard sk(shader_mu);
+        for (const auto& kv : programs)
+            for (const auto& up : kv.second) {
+                if (!up) continue;
+                const Program& p = *up;
+                progs++;
+                other += (int64_t)(sizeof(Program) + p.answers.capacity() * sizeof(Program::Answer) + p.questions.capacity() +
+                                   p.binding_types.capacity() * sizeof(VkDescriptorType) + p.fallback_compute.capacity() * sizeof(VkPipeline));
+                stage_vec += (int64_t)(p.stages.capacity() * sizeof(Stage));
+                for (const Stage& st : p.stages) {
+                    stages++;
+                    c1 += (int64_t)st.c1.capacity(), c1_max = std::max<int64_t>(c1_max, (int64_t)st.c1.capacity());
+                    handles += (int64_t)(st.info.handle_programs.capacity() * sizeof(std::vector<uint32_t>));
+                    for (const auto& h : st.info.handle_programs) handles += (int64_t)(h.capacity() * 4);
+                    legacy += (int64_t)st.info.legacy_stores_mapping.size() * 48;
+                    const Shader::Info& i = st.info;
+                    lists += info_lists_bytes(i);
+                    if (i.texture_descriptors.capacity() > 12) spill += (int64_t)(i.texture_descriptors.capacity() * sizeof(i.texture_descriptors[0]));
+                    if (i.image_descriptors.capacity() > 4) spill += (int64_t)(i.image_descriptors.capacity() * sizeof(i.image_descriptors[0]));
+                    if (i.texture_buffer_descriptors.capacity() > 6) spill += (int64_t)(i.texture_buffer_descriptors.capacity() * sizeof(i.texture_buffer_descriptors[0]));
+                    if (i.image_buffer_descriptors.capacity() > 2) spill += (int64_t)(i.image_buffer_descriptors.capacity() * sizeof(i.image_buffer_descriptors[0]));
+                }
+            }
+    }
+    logf("vk: heap report: program records: %lld programs, %lld stages (%zu bytes each): stage arrays %lld KB, c1 %lld KB (largest %lld), "
+         "handle programs %lld KB, legacy stores ~%lld KB, descriptor lists past their inline room %lld KB, the rest ~%lld KB; "
+         "c1 trimmed in %lld stages, %lld -> %lld KB (RX_VK_C1_TRIM); descriptor lists %lld KB in all, those read shrunk %lld -> %lld KB "
+         "(RX_VK_INFO_SHRINK)",
+         (long long)progs, (long long)stages, sizeof(Stage), (long long)(stage_vec >> 10), (long long)(c1 >> 10), (long long)c1_max,
+         (long long)(handles >> 10), (long long)(legacy >> 10), (long long)(spill >> 10), (long long)(other >> 10),
+         (long long)c1_trimmed.load(), (long long)(c1_before.load() >> 10), (long long)(c1_after.load() >> 10), (long long)(lists >> 10),
+         (long long)(info_before.load() >> 10), (long long)(info_after.load() >> 10));
+}
+
+// (2026-11-26, PC1) RX_VK_C1_TRIM=1 (off by default): a stage read from the file keeps only the part of its c1 constants
+// (the code area's tail) its SPIR-V reads, constant_buffer_used_sizes[1] rounded up to 16 bytes; the draw binds what is
+// kept (vk_draw.cpp, index 1) and zeros to 16. Left whole: a stage with handle programs (they read c1 at any offset), one that
+// reads c1 indirectly (the recompiler marks those 64 KiB used) and a stage whose used size is past what it has. Only read
+// stages: a translated one is written to the file whole first (program_cache_save)
+void c1_trim(Stage& st) {
+    static const bool on = env_on("RX_VK_C1_TRIM");
+    if (!on || st.c1.empty() || !st.info.handle_programs.empty()) return;
+    const uint64_t used = (st.info.constant_buffer_used_sizes[1] + 15ull) & ~15ull;
+    if (used >= st.c1.size()) return;
+    c1_before += (int64_t)st.c1.capacity();
+    st.c1.resize((size_t)used);
+    st.c1.shrink_to_fit();
+    c1_after += (int64_t)st.c1.capacity();
+    c1_trimmed++;
+}
+
+// (2026-11-26, PC2) RX_VK_INFO_SHRINK (on; =0 off): the descriptor lists of a stage read from the file down to what they
+// hold. Eden's boost::container small_vector and static_vector are std::vectors here (gpu/vk/compat, in the translator's stamp:
+// not changed) whose constructors reserve their inline size: 64 storage buffers, 18 constant buffers, 12 textures, 6 texture
+// buffers, 4 images, 2 image buffers, on the heap for every Shader::Info made. 45.log: ~360 MiB under Info::Info from the
+// program cache's reads, most of it room never used. Nothing appends to them after the read
+std::atomic<int64_t> info_before{0}, info_after{0};
+template <typename V> int64_t list_cap(const V& v) { return (int64_t)(v.capacity() * sizeof(typename V::value_type)); }
+int64_t info_lists_bytes(const Shader::Info& i) {
+    return list_cap(i.constant_buffer_descriptors) + list_cap(i.storage_buffers_descriptors) + list_cap(i.texture_buffer_descriptors) +
+           list_cap(i.image_buffer_descriptors) + list_cap(i.texture_descriptors) + list_cap(i.image_descriptors);
+}
+void info_shrink(Shader::Info& i) {
+    static const bool on = !getenv("RX_VK_INFO_SHRINK") || env_on("RX_VK_INFO_SHRINK");   // (on by default since 46.log)
+    if (!on) return;
+    info_before += info_lists_bytes(i);
+    i.constant_buffer_descriptors.shrink_to_fit();
+    i.storage_buffers_descriptors.shrink_to_fit();
+    i.texture_buffer_descriptors.shrink_to_fit();
+    i.image_buffer_descriptors.shrink_to_fit();
+    i.texture_descriptors.shrink_to_fit();
+    i.image_descriptors.shrink_to_fit();
+    i.handle_programs.shrink_to_fit();
+    info_after += info_lists_bytes(i);
+}
 
 void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vector<DiskRecord>& recs,
                         std::vector<std::unique_ptr<Program>>& variants) {
@@ -808,6 +922,7 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
             }
             r.list(st.c1);
             get_info(r, st.info);
+            if (!r.bad) c1_trim(st), info_shrink(st.info);   // (PC1, PC2)
             if (r.bad || spirv.empty()) {
                 ok = false;
                 break;
@@ -902,6 +1017,7 @@ std::unique_ptr<Program> program_cache_read_light(FILE* in, std::mutex* mu, uint
     Reader t{tail.data(), tail.data() + tail.size()};
     t.list(st.c1);
     get_info(t, st.info);
+    if (!t.bad) c1_trim(st), info_shrink(st.info);   // (PC1, PC2)
     if (t.bad || !answers_fit(*p, p->answers)) return nullptr;
     p->code_at = d.at + (int64_t)code_at, p->code_words = words;
     p->ready.store(true, std::memory_order_release);
@@ -1189,7 +1305,52 @@ std::unordered_set<KeyVariant, KeyVariantHash> built;   // (precompile_run built
 std::unordered_map<KeyVariant, Dropped, KeyVariantHash> dropped;
 std::atomic<bool> any{false};   // (set by program_cache_drop_modules or _drop_loaded: until then nothing here is looked up)
 std::atomic<int64_t> remade{0};   // (programs whose modules program_cache_complete_graphics made again)
+// (MR1) the programs made again, by when a build last read their modules (steady ns); under mu. And the builds' lock
+std::unordered_map<const Program*, int64_t> remade_at;
+std::shared_mutex build_rw;
+int64_t redrop_ns() {   // (read once: a build's lock and unlock must agree for the whole run)
+    // (0 off; otherwise at least 30 s, far over the moment between program_cache_complete_graphics and the build it is for)
+    static const int64_t v = [] {
+        const int s = getenv("RX_VK_MODULE_REDROP_S") ? atoi(getenv("RX_VK_MODULE_REDROP_S")) : 0;
+        return (int64_t)(s <= 0 ? 0 : std::max(s, 30)) * 1000000000ll;
+    }();
+    return v;
+}
+bool redrop_on() { return redrop_ns() > 0; }
+// (PR2, 2026-11-27) The programs PR1 (vk_draw.cpp) let every pipeline of go: their modules made again later (a re-entry's builds) are
+// let go again like MR1's, after kPrIdleS seconds with no build of them, MR1 or not. 68.log without it: 0 -> 58 MiB of modules made
+// again in 30 minutes of save-hopping (vk_common_CreateShaderModule under program_cache_complete_graphics), and every re-entered
+// area added its own. Scoped to those programs: MR1 for all of them churned (logs 44, 45). Under mu
+std::unordered_set<const Program*> pr_tracked;
+bool pr_on() {   // (read once, as redrop_ns: a build's lock and unlock must agree for the whole run)
+    static const bool v = [] { const char* e = getenv("RX_VK_PIPE_AREAS"); const char* m = getenv("RX_VK_PR_MODULES");
+                               return e && atoi(e) > 0 && !(m && atoi(m) == 0); }();
+    return v;
+}
+bool locks_on() { return redrop_on() || pr_on(); }
+constexpr int64_t kPrIdleS = 60;
+int64_t idle_ns() { return redrop_on() ? redrop_ns() : kPrIdleS * 1000000000ll; }
+int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 }   // namespace module_remake
+
+ProgramBuildShared::ProgramBuildShared(const Program& p) {
+    if (!module_remake::locks_on()) return;
+    module_remake::build_rw.lock_shared();
+    std::lock_guard rk(module_remake::mu);
+    if (const auto it = module_remake::remade_at.find(&p); it != module_remake::remade_at.end()) it->second = module_remake::now_ns();
+}
+ProgramBuildShared::~ProgramBuildShared() {
+    if (module_remake::locks_on()) module_remake::build_rw.unlock_shared();
+}
+/// (PR2) A program PR1 let every pipeline of go: its modules made again from here on are let go again once idle
+void program_cache_pr_release(const Program* p) {
+    if (!module_remake::pr_on() || !p) return;
+    std::lock_guard rk(module_remake::mu);
+    module_remake::pr_tracked.insert(p);
+    module_remake::remade_at.emplace(p, module_remake::now_ns());   // (modules it holds now: let go once idle too)
+}
 
 void program_cache_note_built(const Program& p) {
     const module_remake::KeyVariant kv{p.key, p.variant};
@@ -1213,7 +1374,12 @@ bool program_cache_complete_graphics(const Program& prog) {
     {
         std::lock_guard rk(module_remake::mu);
         const auto it = module_remake::dropped.find(kv);
-        if (it == module_remake::dropped.end() || it->second.program != &prog) return true;
+        if (it == module_remake::dropped.end() || it->second.program != &prog) {
+            // (MR1: a build about to read them: not idle, so the re-drop leaves them until it is done with them)
+            if (module_remake::redrop_on())
+                if (const auto at = module_remake::remade_at.find(&prog); at != module_remake::remade_at.end()) at->second = module_remake::now_ns();
+            return true;
+        }
         if (it->second.failed) return false;
     }
     const auto skipped = [&](const Stage& st) {   // (a fallback program's compute stages: not in its graphics pipeline)
@@ -1277,6 +1443,8 @@ bool program_cache_complete_graphics(const Program& prog) {
     }
     module_remake::dropped.erase(it);
     module_remake::remade.fetch_add(1, std::memory_order_relaxed);
+    if (module_remake::redrop_on() || (module_remake::pr_on() && module_remake::pr_tracked.count(&prog)))
+        module_remake::remade_at[&prog] = module_remake::now_ns();   // (MR1; PR2)
     return true;
 }
 
@@ -1307,6 +1475,47 @@ size_t program_cache_drop_loaded(Program& p) {
     }
     if (n) module_remake::dropped[kv] = module_remake::Dropped{&p, false};
     return n;
+}
+
+/// (MR1) the programs made again whose modules no build read for RX_VK_MODULE_REDROP_S seconds: let go again (with the builds'
+/// lock held alone, so no build is reading them), and noted as dropped, so the next build of a new state makes them again from
+/// the file on its worker. Called once a present; looks every 10 s
+void program_cache_redrop() {
+    if (!module_remake::locks_on()) return;
+    static int64_t next = 0, total = 0, passes = 0;
+    const int64_t now = module_remake::now_ns();
+    if (now < next) return;
+    next = now + 10'000'000'000ll;
+    std::vector<const Program*> idle;
+    {
+        std::lock_guard rk(module_remake::mu);
+        for (const auto& [p, at] : module_remake::remade_at)
+            if (now - at > module_remake::idle_ns()) idle.push_back(p);
+    }
+    if (idle.empty()) return;
+    size_t modules = 0, programs_n = 0;
+    {
+        // (only when no build is reading modules: the present never waits behind a worker's pipeline build. Tried again in a second)
+        std::unique_lock wl(module_remake::build_rw, std::try_to_lock);
+        if (!wl.owns_lock()) { next = now + 1'000'000'000ll; return; }
+        for (const Program* cp : idle) {
+            Program& p = const_cast<Program&>(*cp);
+            {
+                std::lock_guard rk(module_remake::mu);
+                const auto it = module_remake::remade_at.find(cp);
+                if (it == module_remake::remade_at.end() || now - it->second <= module_remake::idle_ns()) continue;   // (used since)
+                module_remake::remade_at.erase(it);
+            }
+            const size_t n = program_cache_drop_loaded(p);
+            modules += n, programs_n += n ? 1 : 0;
+        }
+    }
+    total += (int64_t)modules, passes++;
+    static int told;
+    if (modules && (told++ < 20 || passes % 30 == 0))
+        logf("vk: shader modules made again for new pipeline states and unused for %llds let go again: %zu of %zu programs now, %lld "
+             "modules in all (RX_VK_MODULE_REDROP_S)", (long long)(module_remake::idle_ns() / 1000000000ll), modules, programs_n,
+             (long long)total);
 }
 
 size_t program_cache_drop_modules() {

@@ -848,15 +848,18 @@ __attribute__((constructor)) void hos_ps5_clock_init(void) {
     fprintf(stderr, "[ps5] clock: the time stamp counter at %llu Hz\n", (unsigned long long)hz);
 }
 
-/* The game's package on the console: HOS_PS5_NUP, else the copy an emulator there already keeps, so one 25 GB file serves
-   both: PS5_Lichii's folder, then the one it had before 2026-11-10 (when neither is there, the first, for the message). */
+/* The game's package on the console: HOS_PS5_NUP, else oot.nup in the title folder itself (/app0, i.e.
+   /data/homebrew/PPSA93339: everything in one folder; NUP1, 2026-11-27), else the copy an emulator there already keeps, so
+   one file serves both: PS5_Lichii's folder, then the one it had before 2026-11-10 (when none is there, Lichii's, for the
+   message). */
 const char *hos_ps5_nup(void) {
-    static const char *const places[] = {"/data/lichii/roms/oot/oot.nup", "/data/prosperoeden/roms/oot/oot.nup"};
+    static const char *const places[] = {"/app0/oot.nup", "/data/homebrew/PPSA93339/oot.nup", "/data/lichii/roms/oot/oot.nup",
+                                         "/data/prosperoeden/roms/oot/oot.nup"};
     const char *set = getenv("HOS_PS5_NUP");
     if (set && *set) return set;
     for (size_t i = 0; i < sizeof places / sizeof *places; i++)
         if (access(places[i], R_OK) == 0) return places[i];
-    return places[0];
+    return places[2];
 }
 static double file_probe_read_gap;
 static void *file_probe_read(void *unused) {   /* (the game's own reads: 64 KiB pieces of its package, here and there) */
@@ -1931,15 +1934,26 @@ static __attribute__((unused)) void swap_give_back(int64_t *phys, uint32_t n) {
 /* The units kept for the game's next commits (free_units) past 256 MiB: their runs of SWAP_RUN_UNITS and more given back to the
    system (klog_11: the cold store took the game's pages from 6.9 to 4.8 GB, but most of that memory stayed kept, out of the
    renderer's reach). The array stays sorted lowest first, as commit_units takes it off the top */
+/* (2026-11-26, KU1) HOS_PS5_KEPT_MB=<MB> (64 by default since 52/53.log, 256 before; 32 at least): how much of it is kept. 50/51.log: 207-236 MiB
+   kept while the textures were short of room; the game takes new units from the system again past it (one mapping each) */
+static uint64_t kept_cap(void) {
+    static uint64_t v;
+    if (!v) {
+        const char *e = getenv("HOS_PS5_KEPT_MB");
+        const long mb = e ? atol(e) : 256;   /* (back to 256: 52/56.log crashed at start with 64, see CHANGES) */
+        v = (uint64_t)(mb < 32 ? 32 : mb) << 20;
+    }
+    return v;
+}
 static void swap_trim_kept(void) {
     pthread_mutex_lock(&window_lock);
-    if ((uint64_t)free_count * UNIT <= (256ULL << 20)) { pthread_mutex_unlock(&window_lock); return; }
+    if ((uint64_t)free_count * UNIT <= kept_cap()) { pthread_mutex_unlock(&window_lock); return; }
     qsort(free_units, free_count, sizeof *free_units, cmp_i64);
     size_t out = 0;
     for (size_t i = 0; i < free_count;) {
         size_t k = 1;
         while (i + k < free_count && free_units[i + k] == free_units[i] + (int64_t)(k * UNIT)) k++;
-        const int over = (uint64_t)(free_count - i + out) * UNIT > (256ULL << 20);
+        const int over = (uint64_t)(free_count - i + out) * UNIT > kept_cap();
         /* (only the aligned 4 MiB chunks inside the run: no small pieces, klog_12) */
         size_t j = 0;
         while (j < k) {

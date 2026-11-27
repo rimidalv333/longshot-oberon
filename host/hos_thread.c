@@ -45,6 +45,10 @@ struct HosThread {
     int vc_held, vc_last, vc_queued, vc_escaped, vc_starved;
     volatile int vc_kick;
     int64_t vc_since;
+    /* (2026-11-26, BG1, Longshot #1642) HOS_BG_THROTTLE (bg_throttle): 0 not yet looked at, 1 the OptimizeChange thread, 2 any
+       other; and when the throttled thread last woke */
+    int bg_kind;
+    int64_t bg_since;
     CONDITION_VARIABLE vc_cv;
     /* (longshot) fibers: the context running now (NULL: ctx, the thread's own), the thread's host fiber once it
        switched to a guest fiber */
@@ -1928,8 +1932,39 @@ void hos_vcore_back(void) {
    mkw_glue.c: the poll hands over no context, so the compiler need not spill them). It, and everything it calls, must never
    read or write the thread's guest context (Ctx) or run guest code: what it would see there may be older than the loop. A
    stall dump of a thread spinning in a polled loop shows such older registers for the same reason. */
+/* (2026-11-26, BG1, Longshot #1642, measured there on RADV: the Market's frames of 50 ms or more 12-15 -> 2-7, the mean ~1.5 %
+   lower) HOS_BG_THROTTLE=<run us>:<sleep us> (=1: 300:3000; unset or =0: off here, until a console run): OoT's
+   OptimizeChangeBank (guest priority 27, the lowest: on the console it gets only the time nothing else wants) runs without end
+   here, 35-44 % of a logical processor at the Market, even at the host's lowest priority, and slows the thread on the other
+   half of its core. After <run> of running it gives its virtual core up and sleeps <sleep> (whole ms, at least 1), at a
+   checkpoint, where Horizon could switch it out too */
+static void bg_throttle(HosThread *t) {
+    if (!t->bg_kind) t->bg_kind = strstr(t->name, "OptimizeChange") ? 1 : 2;
+    if (t->bg_kind != 1) return;
+    static int64_t run_ns = -1, sleep_ms;
+    if (run_ns < 0) {
+        const char *e = getenv("HOS_BG_THROTTLE");
+        long long r = 0, s = 3000;
+        if (e && *e && *e != '0') {
+            const int n = sscanf(e, "%lld:%lld", &r, &s);
+            if (n < 1 || (n == 1 && r == 1)) r = 300, s = 3000;
+        }
+        sleep_ms = s >= 1000 ? s / 1000 : 1;
+        run_ns = r > 0 ? r * 1000 : 0;
+        if (run_ns) hos_log("threads: OptimizeChangeBanc runs %lld us, then sleeps %lld ms (HOS_BG_THROTTLE)", r, (long long)sleep_ms);
+    }
+    if (!run_ns) return;
+    const int64_t now = hos_now_ns();
+    if (!t->bg_since) t->bg_since = now;
+    if (now - t->bg_since < run_ns) return;
+    const int away = hos_vcore_away();
+    Sleep((DWORD)sleep_ms);
+    if (away) hos_vcore_back();
+    t->bg_since = hos_now_ns();
+}
 void hos_vcore_checkpoint(void) {
     HosThread *t = cur;
+    if (t && t->bg_kind != 2) bg_throttle(t);
     const int kick = t ? __atomic_load_n(&t->vc_kick, __ATOMIC_RELAXED) : 0;
     if (kick) vc_yield(t, kick == 1);
 }

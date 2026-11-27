@@ -1,64 +1,38 @@
-# debug logging, leave on 0 for 1-2% gains
+# Longshot Oberon: longshot_env.txt. One NAME=value per line, # for comments. Copy this file into the title folder on the
+# console as longshot_env.txt (replace the old one). Every line here either matters or is meant to be changed; the rest
+# are the built-in defaults.
+
+# ---- logging ----
+# 0: quiet log, worth 1-2%. Set to 1 (or remove the line) when you want a log to send with a problem.
 HOS_KLOG=0
 
-# set pace & perf to 1 for 30 fps lock
-RX_VK_PACE=1
+# ==== PROFILE: docked 1080p, FSR-upscaled (3D at handheld size, 1536x864), 30 fps, no frame generation ====
+# SAFE handheld's 3D size, but FSR 3.1 upscales it to a real 1920x1080 instead of the Lanczos filter stretching it: sharper
+# on a TV, with the HUD and text drawn at native 1080p. The 3D's render targets stay at handheld size, so it should use
+# only a little more memory than SAFE (the 1080p output buffers), much less than the full-1080p docked profiles.
+HOS_HANDHELD=0
+HOS_OUTPUT_RES=1920x1080
+HOS_PS5_DISPLAY=1920x1080
+HOS_RES_SCALE=0.8
+
+# ---- frame rate ----
+# locked, evenly paced 30 (each frame shown for two refreshes). 0: unlocked
 HOS_PERF_30=1
 
-RX_VK_COMPACT=1
+# ---- picture ----
+# sharpening of the 3D before the HUD, 0-100
+RX_VK_UP_SHARPEN=15
 
-HOS_PS5_CPU=1
-RX_VK_FB_MULTI=1
-RX_VK_CAPTURE=0
-RX_VK_GPU_HANG_SEC=3
+# ---- performance: tested values, don't change ----
+RX_VK_READBACK_LATE=newest,3980
 
-HOS_RES_SCALE=1
-HOS_NATIVE_ZSTD=2
-HOS_PS5_COLD=0
-#HOS_AUDIO_STATS=1
-RX_VK_LOAD=create
-# DO NOT CHANGE THIS TO 2MB IT WILL CAUSE A HARD CRASH ON BASE PS5
-HOS_PS5_TEX_RESERVE_MB=1024
-RX_VK_TEX_MAX_DIM=1024
-RX_VK_TEX_SKIP_MB=32
-RX_VK_PARALLEL=0
+# ---- built in (no need to set; add a line here only to change one) ----
+# The tested memory and performance values are part of the title since 1.2.x: the texture budget (RX_VK_VRAM_MB=1280, max
+# 1024, skip 32), the game's reserve (HOS_PS5_TEX_RESERVE_MB=768) and emergency line (HOS_PS5_MEM_LOW_MB=384), the cold store
+# (HOS_PS5_SWAP_AGE=60), the import size (RX_VK_IMPORT_CHUNK_MB=2), the turn-hitch textures (RX_VK_TEX_FIRST_SMALL_MB=24,
+# _CAP=256), the pipelines of areas left behind let go (RX_VK_PIPE_AREAS=3), the recorder thread and the rest. A line in
+# this file wins over them; NAME=0 turns one off.
 
-# 60 -> 120 (the base-console default) cold store read 142 of 874 MiB back, worst stall 18.7 ms
-HOS_PS5_SWAP_AGE=120
-# handheld profile, output res is only considered for docked profile
-HOS_HANDHELD=1
-HOS_OUTPUT_RES=1920x1080
-
-# don't touch unless you know what you are doing
-HOS_VCORES=0
-RX_VK_EVICT_PAUSE_AGE=1
-RX_VK_DESC_POOL_KEEP=0
-RX_VK_TWIN_CARRY=0
-HOS_LIGHT_LAG=0
-RX_VK_UB_LIVE_SIZE=0
-RX_VK_UPLOAD_REPORT_MS=15
-RX_VK_VRAM_MB=1280
-HOS_SPIN_OTHER_US=5
-RX_VK_EVICT_KEEP=0
-RX_VK_PRESS_TIERS=0
-RX_VK_UPLOAD_BUDGET_MS=20
-RX_VK_READBACK_LATE=newest
-HOS_SHORT_SLEEP_TIMER=1
+# ---- shader cache: don't remove (removing them makes the console prepare its shaders again, hours) ----
 RX_VK_MESH_NOCULL=2c56dc1006942f74
 RX_VK_TASK_NOOCCL=2c56dc1006942f74
-
-# sharpness and occlusion
-RX_VK_UP_SHARPEN=15
-RX_VK_OCC_QUERIES=0
-
-# uncomment these two lines for built-in longshot framegen (preferred)
-#RX_VK_FRAMEGEN=1
-#RX_VK_MIHAWKGEN=0
-
-RX_VK_LIGHT_CAP=0
-RX_VK_RECORDER=thread
-
-# Sprint on L3 (the game's own fast run): on by default. HOS_SPRINT=0: off, L3 is the game's LS again.
-# HOS_SPRINT_TOGGLE=0: sprint only while L3 is held (default: a press starts it, Link stopping or the next press ends it).
-#HOS_SPRINT=0
-#HOS_SPRINT_TOGGLE=0

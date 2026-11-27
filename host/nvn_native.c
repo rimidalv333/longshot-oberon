@@ -1269,6 +1269,7 @@ NV(nvnQueueSetDebugLabel) {}
 #define POOL_MAX 26      /* 64 MiB: bigger blocks use the heap */
 #define POOL_KEEP (64ull << 20)
 static SRWLOCK pool_lock = SRWLOCK_INIT;
+static volatile LONG64 pool_heap_n, pool_heap_bytes;   /* (blocks the pool had none of, from the heap: the recordings' log line) */
 static void *pool_head[POOL_MAX + 1];
 static uint64_t pool_bytes[POOL_MAX + 1];
 static int pool_off(void) {
@@ -1285,7 +1286,10 @@ static unsigned pool_class(size_t n) {
 static void *pool_get(size_t n, unsigned *cls, const char *what) {   /* (never NULL: hos_xmalloc) */
     const unsigned c = pool_off() ? POOL_MAX + 1 : pool_class(n);
     *cls = c;
-    if (c > POOL_MAX) return hos_xmalloc(n, what);
+    if (c > POOL_MAX) {
+        InterlockedIncrement64(&pool_heap_n), InterlockedAdd64(&pool_heap_bytes, (LONG64)n);
+        return hos_xmalloc(n, what);
+    }
     AcquireSRWLockExclusive(&pool_lock);
     void *b = pool_head[c];
     if (b) {
@@ -1293,7 +1297,9 @@ static void *pool_get(size_t n, unsigned *cls, const char *what) {   /* (never N
         pool_bytes[c] -= (uint64_t)1 << c;
     }
     ReleaseSRWLockExclusive(&pool_lock);
-    return b ? b : hos_xmalloc((size_t)1 << c, what);
+    if (b) return b;
+    InterlockedIncrement64(&pool_heap_n), InterlockedAdd64(&pool_heap_bytes, (LONG64)1 << c);
+    return hos_xmalloc((size_t)1 << c, what);
 }
 static void pool_put(void *b, unsigned cls) {
     if (!b) return;
@@ -1652,12 +1658,40 @@ NV(nvnCommandBufferGetCommandMemorySize) { RET(CB(P(0))->game_size); }
 NV(nvnCommandBufferGetCommandMemoryUsed) { const nvn_cmd *o = CB(P(0)); RET(o->hw_used < o->game_size ? o->hw_used : o->game_size); }
 NV(nvnCommandBufferGetCommandMemoryFree) { const nvn_cmd *o = CB(P(0)); RET(o->game_size - (o->hw_used < o->game_size ? o->hw_used : o->game_size)); }
 
+/* (longshot) The hand-off (on unless HOS_NVN_REC_HANDOFF=0): a finished recording that fills at least half of its
+   command buffer's segment is not copied: the segment itself becomes the handle and the command buffer takes a fresh
+   segment of the same size from the pool. EndRecording's copy of the recorded commands (flatten) was 2.8 % of the main
+   thread's time in the Market and 3.6 % in Hyrule Field by day (RTX 3090, 5900X; cpu-profile.md's candidate 4). The
+   segment keeps room for a copy's prefix at its start (rec_begin), so a recording handed off is laid out as flatten's
+   copy is: prefix, then the commands, and freed the same way (its pool class in the prefix). Under half full it is
+   copied as before: copies live until their control memory is added again (~40,000 to 80,000 at once), and a segment is
+   at least 64 KB. HOS_NVN_REC_HANDOFF=0: every recording copied, as before, byte for byte */
+static int rec_handoff_on(void) {
+    static int v = -1;
+    if (v < 0) {   /* (2026-11-26, Longshot #1780 ported: off unless set, until a console run) */
+        const char *e = getenv("HOS_NVN_REC_HANDOFF");
+        v = e && *e && *e != '0';
+    }
+    return v;
+}
+static volatile LONG64 rec_handed, rec_handed_bytes;   /* (recordings handed off, for the recordings' log line) */
+#define REC_PREFIX sizeof(copy_prefix)
+#define REC_BEGUN 0x4e55474542434552ull   /* (in the prefix's room while a recording that rec_begin started is made) */
+/* a recording starts: at the segment's start, or after a copy's prefix with the hand-off on */
+static void rec_begin(cmd_rec *r) {
+    r->cur = r->seg;
+    if (!rec_handoff_on()) return;
+    cmd_reserve_rec(r, REC_PREFIX);
+    const uint64_t begun = REC_BEGUN;
+    memcpy(r->seg, &begun, sizeof begun);
+    r->cur += REC_PREFIX;
+}
 NV(nvnCommandBufferBeginRecording) {
     nvn_cmd *o = CB(P(0));
     if (o->recording) hos_log("nvn: BeginRecording while recording");
     o->recording = 1;
     cmd_rec *r = cmd_host(o);
-    r->cur = r->seg;
+    rec_begin(r);
     o->rec_start = o->cmd_used;
     uint8_t *p = cmd_alloc(o, 8);
     put_hdr(p, NOP_BEGIN, 8);
@@ -1675,6 +1709,34 @@ static uint8_t *flatten(const uint8_t *p, size_t n) {
     pre->bytes = sizeof(copy_prefix) + n;
     InterlockedAdd64(&copy_bytes, (LONG64)pre->bytes);
     return out + sizeof(copy_prefix);
+}
+/* the recording made in r (BEGIN to END) as a handle: the segment handed over (rec_handoff_on, at least half of it used),
+   or a copy (HOS_NVN_REC_HANDOFF=0: always a copy). Only a recording rec_begin started (its mark in the prefix's room,
+   taken off here) has the room; any other end is copied from the segment's start, as before */
+static uint8_t *rec_end(cmd_rec *r) {
+    size_t off = 0;
+    if (rec_handoff_on() && r->seg && r->cur >= r->seg + REC_PREFIX) {
+        uint64_t mark;
+        memcpy(&mark, r->seg, sizeof mark);
+        if (mark == REC_BEGUN) {
+            off = REC_PREFIX;
+            memset(r->seg, 0, sizeof mark);
+        }
+    }
+    const size_t n = r->seg ? (size_t)(r->cur - r->seg) - off : 0;
+    const size_t cap = r->seg ? (size_t)(r->end - r->seg) : 0;
+    if (!off || (REC_PREFIX + n) * 2 < cap) return flatten(r->seg + off, n);
+    unsigned got;
+    uint8_t *fresh = (uint8_t *)pool_get(cap, &got, "native NVN: recording buffer");
+    copy_prefix *pre = (copy_prefix *)r->seg;
+    pre->cls = pool_off() ? POOL_MAX + 1 : pool_class(cap);   /* (as cmd_release would give the segment back) */
+    pre->magic = COPY_MAGIC;
+    pre->bytes = REC_PREFIX + n;
+    InterlockedAdd64(&copy_bytes, (LONG64)pre->bytes);
+    InterlockedIncrement64(&rec_handed), InterlockedAdd64(&rec_handed_bytes, (LONG64)n);
+    uint8_t *h = r->seg + REC_PREFIX;
+    r->seg = fresh, r->cur = fresh, r->end = fresh + cap;   /* (seg_bytes, seg_count: one segment for another of its size) */
+    return h;
 }
 /* (the watches below) the guest's call chain, by frame pointers: "lr < caller < ..." */
 static void guest_chain(Ctx *c, char *b, size_t cap) {
@@ -1702,8 +1764,7 @@ NV(nvnCommandBufferEndRecording) {
     put_hdr(p, NOP_END, 8);
     o->hw_used -= 8;
     o->recording = 0;
-    const cmd_rec *r = cmd_host(o);
-    uint8_t *copy = flatten(r->seg, (size_t)(r->cur - r->seg));
+    uint8_t *copy = rec_end(cmd_host(o));
     /* the copy is tied to the control memory position the console driver's descriptor would take */
     const uint64_t at = o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     o->ctl_used += 64;
@@ -1741,9 +1802,13 @@ NV(nvnCommandBufferEndRecording) {
             hos_log_at(HOS_LOG_DEBUG, "nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", swept, live_copies);
         if (report)
             hos_log("nvn: %llu recordings made, %zu live copies (%.1f MB), %zu texture copies; %lld command buffers' segments "
-                    "(%.1f MB)", (unsigned long long)recording, live_copies, __atomic_load_n(&copy_bytes, __ATOMIC_RELAXED) / 1048576.0,
+                    "(%.1f MB); of the last 50000, %lld handed off (%.1f MB), the rest copied; %lld blocks from the heap "
+                    "since the last line (%.1f MB)", (unsigned long long)recording, live_copies,
+                    __atomic_load_n(&copy_bytes, __ATOMIC_RELAXED) / 1048576.0,
                     __atomic_load_n(&npins, __ATOMIC_RELAXED), (long long)__atomic_load_n(&seg_count, __ATOMIC_RELAXED),
-                    __atomic_load_n(&seg_bytes, __ATOMIC_RELAXED) / 1048576.0);
+                    __atomic_load_n(&seg_bytes, __ATOMIC_RELAXED) / 1048576.0, (long long)InterlockedExchange64(&rec_handed, 0),
+                    InterlockedExchange64(&rec_handed_bytes, 0) / 1048576.0, (long long)InterlockedExchange64(&pool_heap_n, 0),
+                    InterlockedExchange64(&pool_heap_bytes, 0) / 1048576.0);
         if (away) hos_vcore_back();
     }
     if (watch_draw_cmd && watch_draw_cmd == (void *)o && nwatch_handles < 16) {

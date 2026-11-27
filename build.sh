@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Longshot Oberon: builds the PS5 title folder PPSA93339 from your own game file, on Linux or Ubuntu under WSL.
 #
-#   ./build.sh <your oot.nup> [--jobs N] [--out DIR] [--skip-hash-check]
+#   ./build.sh [your oot.nup] [--jobs N] [--out DIR] [--skip-hash-check]
+#
+# With no game file named, the .nup beside build.sh is used (put your oot.nup in this folder and run ./build.sh).
 #
 # Everything the build needs comes in deps/ (the release zip): clang/lld 18, Python with its packages, the PS5 payload
 # SDK, RADV (PS5_Mesa) and PS5_Vulkan's link tools, FFmpeg, zstd, the Vulkan headers and PS5_MihawkGen. Nothing is
@@ -18,7 +20,7 @@
 set -euo pipefail
 
 TITLE_ID=PPSA93339
-VERSION=1.2.0
+VERSION=2.0.0
 # (the game's program as the build lifts it, decompressed: the same from any good dump of 1.1.1)
 EXEFS_SHA256="2591fb99008d0814f8056c3f36b36790048ed857ff0ae2bb3a4c1e37b960a4de  main
 94c154d83cbaca00d092958cc2b3a0494d7308fe49de8cb33ece7e9e67303ea7  main.npdm
@@ -42,11 +44,17 @@ while (( $# )); do
     esac
     shift
 done
-[[ -n $game ]] || die "usage: ./build.sh <your oot.nup> [--jobs N] [--out DIR]"
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -z $game ]]; then   # (NUP1: the .nup beside build.sh, when none is named)
+    shopt -s nullglob nocaseglob
+    nups=("$root"/*.nup)
+    shopt -u nullglob nocaseglob
+    (( ${#nups[@]} )) || die "no game file: put your oot.nup beside build.sh, or name it: ./build.sh <your oot.nup> [--jobs N] [--out DIR]"
+    (( ${#nups[@]} == 1 )) || die "more than one .nup beside build.sh (${nups[*]##*/}): name the one to use: ./build.sh <your oot.nup>"
+    game=${nups[0]}
+fi
 [[ -f $game ]] || die "no such file: $game"
 game=$(realpath -- "$game")
-
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 deps="$root/deps"
 cd "$root"
 logs="$root/work/logs"
@@ -99,8 +107,12 @@ if [[ -n $skip_hash ]]; then
 elif [[ $(cat "$check" 2> /dev/null) == "$mark" ]]; then
     note "checked already"
 else
+    note "(if this check fails on a dump you know is good, run the same command again with --skip-hash-check at the end)"
     if ! "$python" -I -X utf8 ps5/tools/check_nup.py "$game" | sed 's/^/    /'; then
-        die "$(basename -- "$game") is not a good .nup of Ocarina of Time 1.1.1 (see above)"
+        die "$(basename -- "$game") is not a good .nup of Ocarina of Time 1.1.1 (see above). If you are sure it is your own good
+dump (the check re-reads each file up to five times; a PC with unstable memory, XMP/EXPO on, can fail it), you can try:
+    bash build.sh $(printf '%q' "$game") --skip-hash-check
+That build is unsupported: a damaged file then shows as crashes or wrong pictures in the game."
     fi
     printf '%s\n' "$mark" > "$check"
 fi
@@ -161,9 +173,17 @@ else
 fi
 
 step "the title: the game, the runtime and the renderer compiled and linked (30 to 90 minutes the first time)"
-if ! PS5_VK_PGO="$root/ps5/profiles/vk.profdata" PS5_VK_LTO=thin "$python" -I ps5/build.py --jobs "$jobs" 2>&1 | tee "$logs/title.log"; then
-    die "the title was not built; the whole log: $logs/title.log (if the compiler was killed for want of memory, use --jobs 2)"
-fi
+# (2026-11-26) A failed compile is tried once more by itself: what compiled is kept, so the second run only does what is left. A
+# compiler killed once (memory short, a PC's unstable memory) usually gets through the second time. PS5_VK_PGO set outside
+# (a counting build, "gen", or another profile) is used instead of the shipped profile
+vk_pgo="${PS5_VK_PGO:-$root/ps5/profiles/vk.profdata}"
+for attempt in 1 2; do
+    if PS5_VK_PGO="$vk_pgo" PS5_VK_LTO=thin "$python" -I ps5/build.py --jobs "$jobs" 2>&1 | tee "$logs/title.log"; then
+        break
+    fi
+    (( attempt < 2 )) || die "the title was not built twice; the whole log: $logs/title.log (if the compiler was killed for want of memory, use --jobs 2 or --jobs 1)"
+    note "the title's build failed (the end of its log is above): trying once more, with what compiled kept"
+done
 title="$root/dist/$TITLE_ID"
 [[ -f $title/eboot.bin && -f $title/image.bin ]] || die "no title at $title; the log: $logs/title.log"
 
@@ -201,7 +221,11 @@ Built: $title ($(du -sh -- "$title" | cut -f1))
 
 On the console, with its homebrew environment running and an FTP server on:
   1. Copy the whole $TITLE_ID folder to /data/homebrew/$TITLE_ID.
-  2. Copy your game file to /data/lichii/roms/oot/oot.nup (make the folders; the name must be oot.nup).
+  2. Copy your game file, named oot.nup, to one of these (the first one there is used):
+       /data/homebrew/$TITLE_ID/oot.nup       in the title folder itself: everything in one folder
+       /data/lichii/roms/oot/oot.nup          shared with PS5_Lichii (make the folders)
+       /data/prosperoeden/roms/oot/oot.nup    PS5_Lichii's older folder
+     or any path, set as HOS_PS5_NUP=<path> in longshot_env.txt.
   3. Start Longshot Oberon from the home screen (ShadowMountPlus puts it there) or your homebrew launcher.
 The first start translates every shader into the title's cache/ folder (several hours, once); the title closes when
 that is done: start it again to play. longshot_env.txt and longshot_options.ini in the folder are the settings.

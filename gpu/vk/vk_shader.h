@@ -178,6 +178,18 @@ void program_cache_note_built(const Program& p);
 /// (longshot) p's graphics modules were let go (program_cache_drop_modules) and not made again yet: no pipeline is built from it
 /// until program_cache_complete_graphics has made them
 bool program_modules_dropped(const Program& p);
+/// (2026-11-26, MR1) RX_VK_MODULE_REDROP_S=<s> (0, off, by default): the graphics modules a program had made again for a new pipeline
+/// state (program_cache_complete_graphics) are let go again once no pipeline of it was built for that long (program_cache_redrop,
+/// from the present's status tick). A build of a program holds program_build_shared while it reads its modules; the re-drop
+/// holds it alone. Without it the made-again modules stayed for the session: 36 -> 116 MiB in 38.log's heap report by caller
+struct ProgramBuildShared {
+    explicit ProgramBuildShared(const Program& p);
+    ~ProgramBuildShared();
+    ProgramBuildShared(const ProgramBuildShared&) = delete;
+    ProgramBuildShared& operator=(const ProgramBuildShared&) = delete;
+};
+void program_cache_redrop();
+void program_cache_pr_release(const Program* p);   // (PR2: vk_progcache.cpp, from PR1's sweep in vk_draw.cpp)
 /// (longshot) Every kept graphics and mesh program's key, in the file's order, no record read; *loaded: the variants in memory already
 std::vector<uint64_t> program_cache_keys(std::vector<Program*>* loaded);
 const Program* program_find(uint64_t key, uint64_t variant);

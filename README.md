@@ -58,7 +58,7 @@ your own game file and it builds the title folder:
 ./build.sh /path/to/oot.nup
 ```
 
-Out comes `dist/PPSA93339`, ready to copy to the console: the executable, the game's shader list, the PS5 button
+(or put `oot.nup` beside `build.sh` and run `./build.sh` alone). Out comes `dist/PPSA93339`, ready to copy to the console: the executable, the game's shader list, the PS5 button
 prompts, the data mods, and the settings this port ships with. Nothing is downloaded and nothing is installed on your PC.
 See [Install and play](#install-and-play).
 
@@ -169,12 +169,14 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
    cp /mnt/c/Users/<you>/Downloads/release.zip .
    sudo apt install -y unzip    # if unzip is missing
    unzip release.zip
-   cd longshot-oberon
+   cd longshot_oberon
    ```
 3. Build, giving it your game file (a Windows path is under `/mnt/<drive>/`):
    ```bash
    bash build.sh /mnt/d/Games/oot.nup
    ```
+   Or copy `oot.nup` into the `longshot_oberon` folder and run `bash build.sh` with no game file: the `.nup` beside
+   `build.sh` is used.
    Options: `--jobs N` (files compiled at once; fewer if the build is killed for memory), `--out DIR` (also copy the
    finished folder there). An interrupted build continues where it stopped when you run it again.
 
@@ -184,8 +186,11 @@ The result is `dist/PPSA93339`. Everything in it that was made from your game (`
 ### Put it on the console
 
 1. Copy the whole `PPSA93339` folder to `/data/homebrew/PPSA93339`.
-2. Copy your game file to `/data/lichii/roms/oot/oot.nup` (make the folders; the name must be `oot.nup`).
-   `/data/prosperoeden/roms/oot/oot.nup` works too.
+2. Copy your game file, named `oot.nup`, to one of these (the first one there is used):
+   - `/data/homebrew/PPSA93339/oot.nup`: in the title folder itself, so everything is in one folder;
+   - `/data/lichii/roms/oot/oot.nup`: shared with PS5_Lichii (make the folders);
+   - `/data/prosperoeden/roms/oot/oot.nup`: PS5_Lichii's older folder;
+   - or any path, set as `HOS_PS5_NUP=<path>` in `longshot_env.txt`.
 3. Start **Longshot Oberon** from the home screen (ShadowMountPlus puts it there) or from your homebrew launcher.
 
 ### First start
@@ -207,13 +212,14 @@ name starts with `_` is skipped, so renaming a folder turns a mod on or off. The
 
 | Mod | On by default | What it does | Measured |
 |---|---|---|---|
-| `PerfShadow500` | yes | Sun-shadow distance of the first cascade 3000 → 500 (`gsys/ModelSceneConfigParam`) | 2,500–2,999 draws: 30.7 → 34.3 fps; lighter scenes unchanged |
+| `PerfCombo` | yes | Sun-shadow reach 200 m with two cascades (`gsys/ModelSceneConfigParam`), and NPC shadows that fade out at 13–16 m (`System/GameGraphics/LocalDepthShadowParam`) | Lighter shadow work in busy scenes; MainField's sun shadows fade by 200 m anyway |
+| `_PerfShadow500` | no | Sun-shadow distance of the first cascade 3000 → 500 (`gsys/ModelSceneConfigParam`) | 2,500–2,999 draws: 30.7 → 34.3 fps; lighter scenes unchanged |
 | `_PerfShadow200` | no | The same at 200 | Further, more visible cut |
 | `_PerfShadowLite` | no | 200, and two shadow cascades instead of three | Untested |
 | `Saturation115` | yes | Turns on the game's own (shipped but disabled) colour-correction step, at saturation 1.15 with a neutral tint (`agl/ColorCorrectionParam`) | Visual only |
 | `_Saturation130` | no | The same at 1.30 | Visual only |
 
-Use one shadow mod and one saturation mod at a time: each pair replaces the same file.
+Use one shadow mod (PerfCombo or one PerfShadow) and one saturation mod at a time: each group replaces the same file.
 WARNING: Any other mods have not been tested. This is very experimental.
 
 **PS5 button prompts.** The builder runs Longshot's prompt generator on your game files. It redraws the game's button

@@ -29,6 +29,7 @@ struct Texture {
     VkImageCreateFlags create_flags = 0;   // (longshot: as its image was made, for the compaction's copy of it)
     uint32_t width = 1, height = 1, depth = 1, levels = 1, layers = 1;   // the image's (after skip)
     uint32_t skip = 0;        // top levels of the texture left out (huge textures: RX_VK_TEX_MAX_DIM, _MAX_MB)
+    uint32_t rt_pct = 100;    // (longshot, issue 1295; #1367) made at rt_pct % of the game's side, drawn so: static_shadow_map.h
     // (a huge array kept whole as a sparse resident image instead: each layer gets device memory when it is first
     // written, so only what the game streams in costs VRAM. MKW's terrain arrays, 8192 x 8192 x 68 BC6H: 5.8 GB
     // each, written by the GPU's copies into level 0, which a texture with its top level left out lost)
@@ -48,6 +49,7 @@ struct Texture {
     bool bc = false;          // (and kept as BC3 or BC7: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
     bool bc_resized = false;  // (longshot-amd: its BC image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
     bool pressed = false;     // (PS5: made small while memory was short, made again at its own size later; vk_texture.cpp)
+    bool first_small = false; // (PS5, TP1: made small because its frame's new texture work was over budget; pressed too)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
     // the game's texture
     uint64_t gpu = 0, guest = 0, guest_size = 0;   // storage (GPU address, guest address, bytes)

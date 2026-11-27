@@ -496,7 +496,47 @@ static int env_line_allowed(const char *name, const char *value) {
     const int drive = ((value[0] | 0x20) >= 'a' && (value[0] | 0x20) <= 'z' && value[1] == ':');
     return !strpbrk(value, "/\\") && !drive && value[0] != '~' && strcmp(value, ".") && strcmp(value, "..");
 }
+#ifdef __PROSPERO__
+/* (2026-11-27, DF1) The base PS5's tested values, built in: every premade profile and the shipped longshot_env.txt had the first
+   block word for word ("tested values, don't change"), and the second is what the 2026-11-26 sessions settled on (logs 42-63:
+   CHANGES-2026-11-25-UPSTREAM.md, SESSION-2026-11-26.md). Set before the env file is read and never over a value already there,
+   so a line in longshot_env.txt (or the environment) still wins, and NAME=0 still turns a thing off. Not here: what a player
+   tunes (resolution, frame rate, sharpening, the log, frame generation) and the two shader-cache switches the files keep */
+static void ps5_env_defaults(void) {
+    static const char *const defaults[][2] = {
+        /* the profiles' tested values */
+        {"HOS_LIGHT_LAG", "0"}, {"HOS_NATIVE_ZSTD", "2"}, {"HOS_SPIN_OTHER_US", "5"}, {"HOS_VCORES", "0"}, {"HOS_OBJ_CACHE", "16384"},
+        {"RX_VK_EVICT_KEEP", "0"}, {"RX_VK_EVICT_PAUSE_AGE", "1"}, {"RX_VK_LIGHT_CAP", "0"}, {"RX_VK_OCC_QUERIES", "0"},
+        {"RX_VK_PRESS_TIERS", "0"}, {"RX_VK_RECORDER", "thread"}, {"RX_VK_TEX_MAX_DIM", "1024"}, {"RX_VK_TEX_SKIP_MB", "32"},
+        {"RX_VK_UPLOAD_BUDGET_MS", "20"}, {"RX_VK_VRAM_MB", "1280"},
+        /* 2026-11-26: memory (logs 51-63) */
+        {"HOS_PS5_TEX_RESERVE_MB", "768"}, {"HOS_PS5_MEM_LOW_MB", "384"}, {"HOS_PS5_SWAP_AGE", "60"}, {"RX_VK_IMPORT_CHUNK_MB", "2"},
+        /* 2026-11-26: turn hitches (TP1-TP6, logs 54-63) */
+        {"RX_VK_TEX_FIRST_SMALL_MB", "24"}, {"RX_VK_TEX_FIRST_SMALL_CAP", "256"},
+        /* 2026-11-26: Longshot #1642 (BG1), #1780, #1994 ports (logs 50-63) */
+        /* (HOS_BG_THROTTLE left out since 2026-11-27: off, as upstream; suspected in 66.log's Castle Town crash, 67/68 ran without it) */
+        {"HOS_NVN_REC_HANDOFF", "1"}, {"RX_VK_REPLAYED_CACHE", "1"},
+        /* 2026-11-27: the submit-time capture off on every PS5, not only the base one (base_profile): off in every log (1-63);
+           on, it copies each submit's written pages (CPU on the game's thread, memory for the copies) for a threaded
+           renderer this port does not use */
+        {"RX_VK_CAPTURE", "0"},
+        /* 2026-11-27: PR1, pipelines of areas left behind let go (68.log: 12 areas, no crash, the table held at 1.3-2.2k) */
+        {"RX_VK_PIPE_AREAS", "3"},
+    };
+    for (size_t i = 0; i < sizeof defaults / sizeof *defaults; i++) setenv(defaults[i][0], defaults[i][1], 0);
+}
+#endif
+static void load_longshot_env_file(void);
+/* (DF2, 2026-11-27) The built-in defaults after the file, not before: set first, they were in the environment when the file was
+   read, and the file's line for one of them was left out as "set in the environment, which goes first" (69.log: HOS_VCORES=1
+   ignored; 67/68's HOS_BG_THROTTLE=0 too). setenv(..., 0) after it fills only what neither the environment nor the file set */
 static void load_longshot_env(void) {
+    load_longshot_env_file();
+#ifdef __PROSPERO__
+    ps5_env_defaults();
+#endif
+}
+static void load_longshot_env_file(void) {
     char path[MAX_PATH + 32];
     const char *other = getenv("HOS_ENV_FILE");
 #ifdef __PROSPERO__
@@ -1905,6 +1945,10 @@ static int game_main(int argc, char **argv) {
        it, and after longshot_env.txt, which may set HOS_OPTIONS_FILE; Linux's main chose it already: host/options_path.c) */
     hos_options_choose(argc, argv);
     {
+        void hos_oot_heap_test_init(void);   /* (Longshot #2452: the heap test switches, before game threads start) */
+        hos_oot_heap_test_init();
+    }
+    {
         const char *protect_hearts = getenv("HOS_OOT_PROTECT_HEARTS");
         hos_oot_protect_hearts = protect_hearts && !strcmp(protect_hearts, "1");
     }
@@ -2319,6 +2363,7 @@ int main(int argc, char **argv) {
         }
     }
     hos_options_choose(argc, argv);   /* (before the Discord status reads it, below: host/options_path.c) */
+    { void hos_oot_heap_test_init(void); hos_oot_heap_test_init(); }   /* (Longshot #2452; idempotent) */
     driver_cache_room();
     driver_cache_folder();
 #ifdef __PROSPERO__

@@ -62,6 +62,7 @@
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_texture.h"
+#include "static_shadow_map.h"   // (issue 1295, Longshot #1367: the smaller static shadow map's viewport, scissor and clears)
 #include "movie_upscale_policy.h"
 #include "skip_code.h"
 #include "driver_faults.h"
@@ -1294,6 +1295,8 @@ struct Targets {
     int n = 0;
     bool has_block_images = false;
     uint32_t width = 0, height = 0;
+    uint32_t depth_pct = 100;  // (longshot, issue 1295) the depth target made at depth_pct % of the game's side: the game's
+                               // viewport, scissor and clears scaled to it (static_shadow_map.h)
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
@@ -1331,8 +1334,39 @@ struct PipeEntry {
     std::atomic<const Program*> prog{nullptr};          // (ProjectReLink e894874: the program object it was built from)
     std::atomic<uint8_t> how{0};   // (the census: how play made it, UseCounters::made_how; 0: before play, or not made)
     std::atomic<uint8_t> quick{0};   // (longshot: quick_pipeline's, before the full build: quick_pipe.h's kNone, kMaking, kTried)
+    std::atomic<uint32_t> area{0};      // (PR1: the area it was last drawn in, pr_area)
+    std::atomic<bool> job_open{false};  // (PR1: a worker's build of it is queued or running: not let go)
 };
 std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;   // (the replay thread's)
+// (PR1, 2026-11-27, base PS5) Pipelines of areas left behind let go. Every pipeline made stayed for the session: 63.log made
+// 3,447 -> 14,643 and the heap's blocks in use went 1,049 -> 1,296 MiB with them (~55 KB each), and the game notes 37,703 in all,
+// so a long session through many areas only ever grew. An area is told by the frames: a stretch of 8 or more presents of fewer
+// than 250 draws (a load's black frames) and then, within the next 60 presents, 32 or more new textures (a pause menu makes
+// none). Each pipeline notes the area it was last drawn in; at each new area the ones not drawn in the last RX_VK_PIPE_AREAS
+// areas (this one included) leave the table on the replay thread, the thread tables forget them (pr_epoch), and each is
+// destroyed once the GPU is past every recording made so far (vk_retirement_value). Drawn again later, one is made again like
+// a new one (the driver's caches have it: a few ms on a worker; its draws may be left out a frame or two meanwhile).
+// RX_VK_PIPE_AREAS=<n> (2 or more; 0 or unset: off, as before)
+std::atomic<uint32_t> pr_area{0};
+std::atomic<uint32_t> pr_epoch{0};
+std::atomic<bool> pr_sweep_req{false};
+struct PrDead { VkPipeline pl; uint64_t after; };
+std::mutex pr_dead_mu;
+std::vector<PrDead> pr_dead;   // (pr_dead_mu)
+std::unordered_set<uint64_t> pr_gone;   // (the keys let go, until asked for again: the replay thread's)
+int64_t pr_let_go = 0, pr_again = 0;
+std::atomic<int64_t> pr_destroyed{0};
+int pr_keep() {
+    static const int k = [] {
+        const char* e = getenv("RX_VK_PIPE_AREAS");
+        int v = e ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v == 1) v = 2;
+        if (v) logf("vk: pipelines not drawn in the last %d areas are let go at each new area (RX_VK_PIPE_AREAS)", v);
+        return v;
+    }();
+    return k;
+}
 // (longshot) Pipelines made ahead of their first draw by the load at a program's create call (vk_programs.cpp), by their keys.
 // `pipelines` is the replay's own and has no lock outside the parallel replay, so a background job puts what it made here and
 // the draw's lookup takes it the first time it asks for that key (graphics_pipeline)
@@ -1347,6 +1381,12 @@ struct KeptPipe {
 };
 std::unordered_map<uint64_t, KeptPipe> kept_ready;
 std::atomic<size_t> kept_ready_n{0};
+// (KR2, 2026-11-26) the keys of kept-ready pipelines let go under memory pressure (kept_ready_sweep): a draw that asks for one
+// later builds it on a worker like a new one (graphics_pipeline), never the synchronous cache ask KR1's let-go ones took on the
+// replay thread. Under kept_ready_mu
+std::unordered_set<uint64_t> kr_freed;
+std::atomic<size_t> kr_freed_n{0};
+std::atomic<int64_t> kr_asked_again{0};
 int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
 // (longshot) skips by the line that made them, reported with the frame statistics (draw_skip_report)
 namespace {
@@ -2682,6 +2722,17 @@ uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, Vk
 bool predicted_key(uint64_t key);   // (the predicted pipelines' keys, below)
 void predicted_use(int how);
 PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]) {
+    static thread_local FlatMap<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache, or until PR1 lets them go)
+    {   // (PR1: a new area's sweep, on this thread, the one the table is used on; then this thread's tables forget what it let go)
+        static thread_local uint32_t pr_seen = 0;
+        if (pr_sweep_req.load(std::memory_order_relaxed)) [[unlikely]] pipeline_sweep();
+        const uint32_t ep = pr_epoch.load(std::memory_order_acquire);
+        if (ep != pr_seen) [[unlikely]] {
+            pr_seen = ep;
+            pipe_fast[0].on = pipe_fast[1].on = false;
+            mine.clear();
+        }
+    }
     // the key: what is baked into it (the rest is dynamic state)
     // (longshot: and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
     // one ran another's shaders under its own descriptors)
@@ -2727,7 +2778,6 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     uint64_t key = pipeline_key(p, s, at, topo);
     const uint64_t own = mix(key, (uint64_t)(uintptr_t)&p);
     const uint64_t mkey = by_program ? own : key;
-    static thread_local FlatMap<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache)
     if (auto m = mine.find(mkey); m != mine.end()) return FINE_X(FC_PIPE_MAP, 1), remember(m->second);
     PROF_EXACT();   // (new to this thread, or new: rare, and a pipeline made can take milliseconds)
     ParLock lk;
@@ -2748,6 +2798,15 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     pcache_init();
     PipeEntry* e = pipelines.emplace(key, std::make_unique<PipeEntry>()).first->second.get();
     e->prog.store(&p, std::memory_order_release);
+    e->area.store(pr_area.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    if (!pr_gone.empty() && pr_gone.erase(key)) pr_again++;   // (PR1: one let go, drawn again)
+    if (kr_freed_n.load(std::memory_order_acquire)) {   // (KR2: let go under memory pressure: a worker builds it, below)
+        std::lock_guard kl(kept_ready_mu);
+        if (kr_freed.erase(key)) {
+            kr_freed_n.store(kr_freed.size(), std::memory_order_release);
+            kr_asked_again.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (kept_ready_n.load(std::memory_order_acquire)) {   // (made at its program's create call: ready, as one the precompile built)
         VkPipeline kept = VK_NULL_HANDLE;
         bool deferred = false;
@@ -2815,6 +2874,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         bool predicted;
     };
     auto job = std::make_shared<Job>();
+    e->job_open.store(true, std::memory_order_release);   // (PR1: not let go while this is queued or running)
     job->e = e, job->p = &p, job->s = s, job->at = at, job->topo = topo, job->cold[0] = cold[0], job->cold[1] = cold[1];
     job->predicted = predicted;
     jobs_push([job] {
@@ -2823,6 +2883,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         // pipeline stays for the session, one more per entry that got one, counted in quick_pipeline's log line)
         if (!program_cache_complete_graphics(*job->p)) {
             job->e->ready.store(true, std::memory_order_release);
+            job->e->job_open.store(false, std::memory_order_release);
             return;
         }
         use_counters.made_how = 0;
@@ -2844,6 +2905,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         job->e->how.store(use_counters.made_how, std::memory_order_relaxed);
         if (job->predicted) predicted_use(use_counters.made_how);
         job->e->ready.store(true, std::memory_order_release);
+        job->e->job_open.store(false, std::memory_order_release);   // (PR1: nothing below reads the entry)
         // (the cold libraries after it and behind what is queued, with no flag: the draw waits for the pipeline above, and
         // jobs_wait runs one job)
         for (int i = 0; i < 2; i++)
@@ -2852,6 +2914,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     }, false, &e->ready, [job]() noexcept {
         // Keep a linked pipeline if one was already usable; otherwise null means the completed build failed.
         job->e->ready.store(true, std::memory_order_release);
+        job->e->job_open.store(false, std::memory_order_release);
     });   // (a draw that waits for it runs it at once if it is still queued: jobs_wait)
     return remember(e);
 }
@@ -2860,6 +2923,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
 /// shader, 3 fragment output
 /// cold: made only if the driver has it compiled already; set, and nothing made, when it would have had to compile
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part, bool* cold) {
+    const ProgramBuildShared hold(p);   // (MR1: its modules are not let go again while they are read here; nothing when off)
     if (at.n < 0 || at.n > 8 || program_modules_dropped(p)) return VK_NULL_HANDLE;   // (longshot: at most 8 colour targets)
     const Shader::Info& vs = *vertex_info(p);
     const auto t0 = std::chrono::steady_clock::now();
@@ -5577,6 +5641,15 @@ Targets targets(NvnState& s) {
                 at.width = at.width ? std::min(at.width, w) : w;
                 at.height = at.height ? std::min(at.height, h) : h;
                 if (!at.n) at.samples = tex->samples;
+                if (tex->rt_pct != 100 && !at.n) {
+                    at.depth_pct = tex->rt_pct;
+                } else if (tex->rt_pct != 100) {   // (not seen: the static shadow map is drawn with no colour target)
+                    static int logged;
+                    if (logged++ < 4)
+                        logf("vk: depth target %#llx made at %u%% of the game's side drawn with %d colour target(s): its "
+                             "draws are not scaled (RX_VK_SHADOW_MAP_SIZE=100: whole)", (unsigned long long)tex->gpu,
+                             tex->rt_pct, at.n);
+                }
             }
         }
     }
@@ -5827,7 +5900,7 @@ int dyn_pack(const NvnState& s, const Targets& at, VkPrimitiveTopology topo, boo
     up[6] = s.stencil_value_mask[0], up[7] = s.stencil_value_mask[1];
     up[8] = s.stencil_mask[0], up[9] = s.stencil_mask[1];
     up[10] = at.width, up[11] = at.height, up[12] = (uint32_t)at.n, up[13] = (uint32_t)at.depth_format;
-    up[14] = at.depth != nullptr;
+    up[14] = (at.depth != nullptr ? 1u : 0u) | at.depth_pct << 1;   // (the scale of the game's viewport and scissor too)
     up[15] = (uint32_t)s.color.blend_en, up[16] = s.chmask.mask;
     up[17] = (uint32_t)topo, up[18] = mesh ? 1u : 0u;
     up[19] = s.restart ? 1u : 0u, up[20] = s.raster_discard ? 1u : 0u, up[21] = s.depth_clamp ? 1u : 0u, up[22] = s.ms.a2c ? 1u : 0u;
@@ -5879,13 +5952,20 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
                     std::find(footprint.begin(), footprint.end(), p.key) != footprint.end();
     // the viewport upside down (negative height): NVN's NDC has +y up, Vulkan's down
     float vx = s.viewport[0][0], vy = s.viewport[0][1], vw = s.viewport[0][2], vh = s.viewport[0][3];
-    if (vw == 0.0f && vh == 0.0f) vx = 0, vy = 0, vw = (float)at.width, vh = (float)at.height;
+    if (vw == 0.0f && vh == 0.0f) {
+        vx = 0, vy = 0, vw = (float)at.width, vh = (float)at.height;
+    } else if (at.depth_pct != 100) {   // (issue 1295: the game's texels of the full image, in the smaller one)
+        float v[4] = {vx, vy, vw, vh};
+        static_shadow_map::scale_viewport(v, at.depth_pct);
+        vx = v[0], vy = v[1], vw = v[2], vh = v[3];
+    }
     d.vp = {vx, vy + vh, vw, -vh, std::clamp(s.depth_near, 0.0f, 1.0f), std::clamp(s.depth_far, 0.0f, 1.0f)};
     d.sc = {{0, 0}, {at.width, at.height}};
     if (s.scissor[2] > 0 && s.scissor[3] > 0) {
-        const int32_t x0 = std::max(0, s.scissor[0]), y0 = std::max(0, s.scissor[1]);
-        const int32_t x1 = std::min<int32_t>(s.scissor[0] + s.scissor[2], (int32_t)at.width);
-        const int32_t y1 = std::min<int32_t>(s.scissor[1] + s.scissor[3], (int32_t)at.height);
+        const auto q = static_shadow_map::scale_rect(s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3], at.depth_pct);
+        const int32_t x0 = std::max(0, q.x), y0 = std::max(0, q.y);
+        const int32_t x1 = (int32_t)std::min<int64_t>((int64_t)q.x + q.w, (int64_t)at.width);
+        const int32_t y1 = (int32_t)std::min<int64_t>((int64_t)q.y + q.h, (int64_t)at.height);
         d.sc = {{x0, y0}, {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)}};
     }
     std::memcpy(d.blend, s.blend_color, sizeof d.blend);
@@ -6162,12 +6242,13 @@ void make_dummies() {
 
 // ---- clears: between the draws of a pass, cut by scissor 0 (as deko3d programs every clear), a channel mask with
 // a full-screen triangle (vkCmdClearAttachments has no write mask; TOTK's maxwell.md 1.3) ----
-VkRect2D clear_rect(const NvnState& s, uint32_t w, uint32_t h) {
+VkRect2D clear_rect(const NvnState& s, uint32_t w, uint32_t h, uint32_t pct = 100) {
     VkRect2D r{{0, 0}, {w, h}};
-    if (s.scissor[2] > 0 && s.scissor[3] > 0) {
-        const int32_t x0 = std::clamp(s.scissor[0], 0, (int32_t)w), y0 = std::clamp(s.scissor[1], 0, (int32_t)h);
-        const int32_t x1 = std::clamp(s.scissor[0] + s.scissor[2], 0, (int32_t)w);
-        const int32_t y1 = std::clamp(s.scissor[1] + s.scissor[3], 0, (int32_t)h);
+    if (s.scissor[2] > 0 && s.scissor[3] > 0) {   // (pct: the target at pct % of the game's side, issue 1295)
+        const auto q = static_shadow_map::scale_rect(s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3], pct);
+        const int32_t x0 = std::clamp(q.x, 0, (int32_t)w), y0 = std::clamp(q.y, 0, (int32_t)h);
+        const int32_t x1 = (int32_t)std::clamp<int64_t>((int64_t)q.x + q.w, 0, (int64_t)w);
+        const int32_t y1 = (int32_t)std::clamp<int64_t>((int64_t)q.y + q.h, 0, (int64_t)h);
         r = {{x0, y0}, {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)}};
     }
     return r;
@@ -6438,9 +6519,22 @@ static bool cubemap_face_skipped(const Targets& at) {
         seen_frame = frame, seen_draws = st_draws;
     }
     const bool settling = frame - busy_since < 90;
+    // (CM2, 2026-11-26) Rounds, not faces: the game repaints its two cubes in turn, one face a frame, and the water samples
+    // them in turn. Skipped face by face, one cube held faces of now and the other faces up to N turns old; under a daytime
+    // sky, whose brightness moves, the water's reflection then pulsed darker and lighter every few frames (the user's video
+    // of 2026-11-26: the water alone, ~7 of 255 darker every third frame; never at night, and not right after a load, where
+    // CM1b draws every turn). Now a whole round of 12 face turns is drawn or left out together, so both cubes always hold
+    // the same moment. RX_VK_CUBEMAP_ROUNDS=0: face by face, as in 1.2.0
+    static const bool rounds = !getenv("RX_VK_CUBEMAP_ROUNDS") || atoi(getenv("RX_VK_CUBEMAP_ROUNDS")) != 0;
+    static uint64_t round_turns = 0;
     if (f.frame != frame) {
         f.frame = frame;
-        f.skip = !settling && (f.turns++ % (uint64_t)every) != 0;
+        if (rounds) {
+            const uint64_t round = round_turns++ / 12;
+            f.skip = !settling && f.turns++ != 0 && (round % (uint64_t)every) != 0;   // (a face's first turn: always drawn)
+        } else {
+            f.skip = !settling && (f.turns++ % (uint64_t)every) != 0;
+        }
         (f.skip ? cube_turns_left : cube_turns_drawn).fetch_add(1);
         const int64_t total = cube_turns_drawn.load() + cube_turns_left.load();
         if (total % 3000 == 0)
@@ -6505,7 +6599,7 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
     }
     clear_after_draws(cmd);
     begin_pass(cmd, at);
-    const VkRect2D rect = clear_rect(s, at.width, at.height);
+    const VkRect2D rect = clear_rect(s, at.width, at.height, at.depth_pct);
     if (!rect.extent.width || !rect.extent.height) return;
     VkClearAttachment ca{};
     ca.aspectMask = aspect;
@@ -8890,6 +8984,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
         const int64_t pipes_new = use.on ? use_counters.pipes_new : 0;   // (another file's thread-local: read for the life log only)
         pe = graphics_pipeline(p, s, at, topo, types);
+        static const bool pr_on = pr_keep() != 0;
+        if (pr_on) {   // (PR1: the area it was last drawn in)
+            const uint32_t a = pr_area.load(std::memory_order_relaxed);
+            if (pe->area.load(std::memory_order_relaxed) != a) pe->area.store(a, std::memory_order_relaxed);
+        }
         if (use.on) use.pipeline(pe->ready.load(std::memory_order_acquire), use_counters.pipes_new != pipes_new);
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
@@ -12037,6 +12136,89 @@ void dry_mark_written(NvnState& s, bool compute, bool first) {
         }
 }
 
+/// (PR1) The new area's sweep (pr_area, above), on the replay thread at its next pipeline lookup. Not with parallel replay (other
+/// threads' tables would hold what leaves), nor before the timeline gives a value past every recording made so far
+void pipeline_sweep() {
+    pr_sweep_req.store(false, std::memory_order_relaxed);
+    const int keep = pr_keep();
+    const uint32_t g = pr_area.load(std::memory_order_relaxed);
+    if (!keep || g < (uint32_t)keep || par_active.load(std::memory_order_relaxed)) return;
+    const uint64_t after = vk_retirement_value();
+    if (!after) return;
+    const size_t before = pipelines.size();
+    std::vector<PrDead> out;
+    std::unordered_set<const Program*> left;   // (PR2: the programs of what leaves)
+    for (auto it = pipelines.begin(); it != pipelines.end();) {
+        PipeEntry* e = it->second.get();
+        const VkPipeline pl = e->pipeline.load(std::memory_order_acquire);
+        if (!pl || e->job_open.load(std::memory_order_acquire) || !e->ready.load(std::memory_order_acquire) ||
+            e->quick.load(std::memory_order_relaxed) == quick_pipe::kMaking || e->area.load(std::memory_order_relaxed) + (uint32_t)keep > g) {
+            ++it;
+            continue;
+        }
+        try {
+            out.push_back({pl, after});
+            if (const Program* pp = e->prog.load(std::memory_order_acquire)) left.insert(pp);
+            if (pr_gone.size() < 400000) pr_gone.insert(it->first);
+        } catch (const std::exception&) {
+            break;
+        }
+        it = pipelines.erase(it);
+    }
+    if (out.empty()) return;
+    // (PR2) a program none of whose pipelines is left: its modules, when it has them made again, are let go again once idle
+    size_t programs_gone = 0;
+    if (!left.empty()) {
+        for (const auto& kv : pipelines)
+            if (const Program* pp = kv.second->prog.load(std::memory_order_acquire)) left.erase(pp);
+        for (const Program* pp : left) program_cache_pr_release(pp);
+        programs_gone = left.size();
+    }
+    pr_let_go += (int64_t)out.size();
+    pr_epoch.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lk(pr_dead_mu);
+        pr_dead.insert(pr_dead.end(), out.begin(), out.end());
+    }
+    logf("vk: area %u: %zu pipelines not drawn in the last %d areas let go (%zu programs with none left), %zu kept (%lld let go so "
+         "far, %lld of them drawn again and made again, %lld destroyed; RX_VK_PIPE_AREAS)", g, out.size(), keep, programs_gone,
+         before - out.size(), (long long)pr_let_go,
+         (long long)pr_again, (long long)pr_destroyed.load());
+}
+/// (PR1) Each present (vk_replay.cpp log_frame_stats): the area count (pr_area) and the let-go pipelines the GPU is done with
+void pipeline_area_present() {
+    if (!pr_keep()) return;
+    static int64_t last_draws = 0, quiet = 0, made_at = 0, check_in = 0;
+    const int64_t d = st_draws - last_draws;
+    last_draws = st_draws;
+    if (d < 250) {
+        if (quiet++ == 0) made_at = (int64_t)texture_made();
+    } else {
+        if (quiet >= 8) check_in = 60;   // (after a load's black frames: told an area by the textures it makes)
+        quiet = 0;
+    }
+    if (check_in > 0 && --check_in == 0) {
+        const int64_t made = (int64_t)texture_made() - made_at;
+        if (made >= 32) {
+            const uint32_t g = pr_area.fetch_add(1, std::memory_order_acq_rel) + 1;
+            pr_sweep_req.store(true, std::memory_order_release);
+            logf("vk: area %u entered (%lld new textures since its load began)", g, (long long)made);
+        }
+    }
+    std::vector<VkPipeline> done;
+    {
+        std::lock_guard lk(pr_dead_mu);
+        if (pr_dead.empty()) return;
+        const uint64_t completed = vk_timeline_completed();
+        std::erase_if(pr_dead, [&](const PrDead& x) {
+            if (x.after > completed) return false;
+            done.push_back(x.pl);
+            return true;
+        });
+    }
+    for (VkPipeline pl : done) vkDestroyPipeline(dev.device, pl, nullptr);
+    pr_destroyed += (int64_t)done.size();
+}
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipes) {
     *draws = st_draws, *skipped = st_skipped, *dispatches = st_dispatches, *pipes = st_pipelines.load();
 }
@@ -12670,7 +12852,64 @@ bool pipeline_keep_ready(uint64_t key, VkPipeline pl, const Program* prog) {
 /// them never drawn by this player: 10,450-10,650 kept against ~3,800 before the list (24, 31, 33.log), the memory the textures
 /// then went without (33.log: free median 1,090 MB, textures made at 128 texels). Called once a present (status_tick), looks
 /// every 10 s
+/// (KR2, 2026-11-26) RX_VK_KEPT_READY_PRESSURE_MB=<MB> (0, off, by default until a console run): while the console has less than
+/// that free, every 2 s, the kept-ready pipelines no draw has taken for RX_VK_KEPT_READY_MIN_S (60) are let go, the longest kept
+/// first, at most RX_VK_KEPT_READY_BATCH (1000) a time. Not timed like KR1: only under pressure, and a freed one a draw asks for
+/// again is built on a worker (kr_freed, graphics_pipeline): a draw that may be left out is left out a frame or two meanwhile, one
+/// that writes memory waits as for any new pipeline. Destroyed at once: a kept-ready pipeline was never bound (a draw takes it
+/// out of the map before it records with it)
+void kept_ready_pressure() {
+#ifdef __PROSPERO__
+    // (1280 by default since 2026-11-26: 38.log, 13,423 let go, 21 % asked for again on workers, no frame-thread hitch. 0: off)
+    static const uint64_t line = (uint64_t)(getenv("RX_VK_KEPT_READY_PRESSURE_MB") ? std::max(0, atoi(getenv("RX_VK_KEPT_READY_PRESSURE_MB"))) : 1280) << 20;
+    if (!line || !kept_ready_n.load(std::memory_order_relaxed)) return;
+    static const int64_t min_s = getenv("RX_VK_KEPT_READY_MIN_S") ? std::max(0, atoi(getenv("RX_VK_KEPT_READY_MIN_S"))) : 60;
+    static const size_t batch = getenv("RX_VK_KEPT_READY_BATCH") ? (size_t)std::max(1, atoi(getenv("RX_VK_KEPT_READY_BATCH"))) : 1000;
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    static int64_t next = 0, told_at = 0;
+    static int64_t freed_all = 0, passes = 0;
+    if (now < next) return;
+    next = now + 2'000'000'000ll;
+    const uint64_t room = hos_ps5_direct_room();
+    if (now - told_at > 60'000'000'000ll && freed_all) {   // (a minute's summary while it has let go of any)
+        told_at = now;
+        logf("vk: kept-ready pipelines let go under %llu MB free: %lld in %lld passes, %lld of them asked for again by a draw (built "
+             "on a worker), %zu kept now, %llu MB free (RX_VK_KEPT_READY_PRESSURE_MB)", (unsigned long long)(line >> 20),
+             (long long)freed_all, (long long)passes, (long long)kr_asked_again.load(), kept_ready_n.load(),
+             (unsigned long long)(room >> 20));
+    }
+    if (room >= line) return;
+    std::vector<std::pair<int64_t, uint64_t>> old;   // (when kept, key)
+    std::vector<VkPipeline> gone;
+    size_t left = 0;
+    {
+        std::lock_guard lk(kept_ready_mu);
+        for (const auto& [key, k] : kept_ready)
+            if (k.pl && now - k.made > min_s * 1'000'000'000ll) old.push_back({k.made, key});
+        std::sort(old.begin(), old.end());
+        if (old.size() > batch) old.resize(batch);
+        for (const auto& [made, key] : old) {
+            const auto it = kept_ready.find(key);
+            gone.push_back(it->second.pl);
+            kept_ready.erase(it);
+            kr_freed.insert(key);
+        }
+        kept_ready_n.store(kept_ready.size(), std::memory_order_release);
+        kr_freed_n.store(kr_freed.size(), std::memory_order_release);
+        left = kept_ready.size();
+    }
+    for (const VkPipeline pl : gone) vkDestroyPipeline(dev.device, pl, nullptr);
+    if (gone.empty()) return;
+    freed_all += (int64_t)gone.size(), passes++;
+    static int told;
+    if (told++ < 30)
+        logf("vk: %llu MB free, under %llu: %zu kept-ready pipelines no draw took in %llds let go, %lld in all, %zu still kept "
+             "(RX_VK_KEPT_READY_PRESSURE_MB)", (unsigned long long)(room >> 20), (unsigned long long)(line >> 20), gone.size(),
+             (long long)min_s, (long long)freed_all, left);
+#endif
+}
 void kept_ready_sweep() {
+    kept_ready_pressure();   // (KR2)
     static const int64_t age_s = getenv("RX_VK_KEPT_READY_S") ? std::max(0, atoi(getenv("RX_VK_KEPT_READY_S"))) : 0;   // (off by default: 36.log, the rebuilds on the replay thread hitched)
     if (!age_s || !kept_ready_n.load(std::memory_order_relaxed)) return;
     const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -12724,6 +12963,8 @@ void pipeline_cache_report() {
          start >> 10, (long long)st_pipelines.load(), kept_ready_n.load());
     void lazy_modules_report();   // (vk_progcache.cpp)
     lazy_modules_report();
+    void program_records_report();   // (PC1, vk_progcache.cpp)
+    program_records_report();
 }
 
 // (longshot) a save put off for builds under way, owed to the serial builds' thread (pipeline_cache_between_builds), and

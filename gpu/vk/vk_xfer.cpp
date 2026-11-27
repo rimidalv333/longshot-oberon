@@ -9,6 +9,7 @@
 #include "vk_xfer.h"
 #include "vk_draw.h"   // (end_pass: a pass cannot stay open across a transfer)
 #include "vk_texture.h"
+#include "static_shadow_map.h"   // (issue 1295, Longshot #1367: regions in the smaller static shadow map)
 #include "vk_gprof.h"
 #ifndef LONGSHOT_ENV_H   // (env_on: the switches' one rule)
 #include "longshot_env.h"
@@ -108,6 +109,13 @@ bool resolve(const nvn_tex* t, const nvn_view* v, bool has_v, const NVNcopyRegio
             logf("vk: copy with level %u of texture %#llx %ux%u, %u levels (its last levels left out): skipped",
                  view_level(view), (unsigned long long)s.tex->gpu, s.tex->width, s.tex->height, s.tex->levels);
         return false;
+    }
+    if (s.tex->rt_pct != 100) {   // (longshot, issue 1295: an image made at rt_pct % of the game's side: the region in its
+        // texels, edges rounded outward; a texture copy with it is a blit)
+        const auto q = static_shadow_map::scale_rect(r.xoffset, r.yoffset, r.width, r.height, s.tex->rt_pct);
+        r.xoffset = q.x, r.yoffset = q.y;
+        if (r.width > 0) r.width = std::max(1, (int)q.w);
+        if (r.height > 0) r.height = std::max(1, (int)q.h);
     }
     s.level = s.down ? 0 : image_level(s.tex, view_level(view));
     const uint32_t lw = std::max(1u, s.tex->width >> s.level), lh = std::max(1u, s.tex->height >> s.level);
@@ -252,6 +260,13 @@ void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to
     }
     Sub s;
     if (!resolve(p.tex, &p.view, p.has_view != 0, p.r, s)) return;
+    if (s.tex->rt_pct != 100) {   // (issue 1295: its texels are not the storage's; static_shadow_map.h)
+        static int logged;
+        if (logged++ < 8)
+            logf("vk: copy %s texture %#llx %ux%u, made at %u%% of the game's side: skipped", to_image ? "into" : "out of",
+                 (unsigned long long)s.tex->gpu, s.tex->width, s.tex->height, s.tex->rt_pct);
+        return;
+    }
     uint64_t size = 0;
     VkBufferImageCopy c{};
     BufferRef span;

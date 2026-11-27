@@ -18,36 +18,16 @@ HOS_PERF_30=1
 # ---- picture ----
 # sharpening of the 3D before the HUD, 0-100
 RX_VK_UP_SHARPEN=15
-# the local-light cap: leave at 0 (off). Any other value makes water reflections flash in long sessions
-RX_VK_LIGHT_CAP=0
-
-# ---- sprint on L3 ----
-# on by default: a press starts it, Link stopping or the next press ends it
-# HOS_SPRINT=0: off, L3 is the game's LS again. HOS_SPRINT_TOGGLE=0: sprint only while L3 is held
-#HOS_SPRINT=0
-#HOS_SPRINT_TOGGLE=0
-
-# ---- memory: tested values, don't change ----
-# kept free for the game; below it new textures come in at low resolution. DO NOT raise it to 2048: hard crash on a base PS5
-HOS_PS5_TEX_RESERVE_MB=1024
-# the textures' budget. 1536 caused memory emergencies and blurry textures in Castle Town
-RX_VK_VRAM_MB=1280
-RX_VK_TEX_MAX_DIM=1024
-RX_VK_TEX_SKIP_MB=32
-RX_VK_EVICT_PAUSE_AGE=1
-RX_VK_EVICT_KEEP=0
-RX_VK_PRESS_TIERS=0
-RX_VK_UPLOAD_BUDGET_MS=20
 
 # ---- performance: tested values, don't change ----
-RX_VK_RECORDER=thread
-RX_VK_OCC_QUERIES=0
 RX_VK_READBACK_LATE=newest,3980
-HOS_OBJ_CACHE=16384
-HOS_NATIVE_ZSTD=2
-HOS_VCORES=0
-HOS_SPIN_OTHER_US=5
-HOS_LIGHT_LAG=0
+
+# ---- built in (no need to set; add a line here only to change one) ----
+# The tested memory and performance values are part of the title since 1.2.x: the texture budget (RX_VK_VRAM_MB=1280, max
+# 1024, skip 32), the game's reserve (HOS_PS5_TEX_RESERVE_MB=768) and emergency line (HOS_PS5_MEM_LOW_MB=384), the cold store
+# (HOS_PS5_SWAP_AGE=60), the import size (RX_VK_IMPORT_CHUNK_MB=2), the turn-hitch textures (RX_VK_TEX_FIRST_SMALL_MB=24,
+# _CAP=256), the pipelines of areas left behind let go (RX_VK_PIPE_AREAS=3), the recorder thread and the rest. A line in
+# this file wins over them; NAME=0 turns one off.
 
 # ---- shader cache: don't remove (removing them makes the console prepare its shaders again, hours) ----
 RX_VK_MESH_NOCULL=2c56dc1006942f74

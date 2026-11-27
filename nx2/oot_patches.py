@@ -20,8 +20,10 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
   camera each frame by the speeds the right stick's turn functions return in s0; hos_camera_scale multiplies them at each of
   their returns, 1.0 as shipped. Even the fastest of the game's own camera speeds turned slowly for players.
 - The OptimizeChangeBank thread's allocations tried again when their heap is full (host/oot_heap_retry.c): f_804566e0's two
-  calls of f_80522050, its GPU memory (GPU_ALLOC_SITES), and its two tryAllocs of CPU buffers (HEAP_ALLOC_SITES). They went on
-  with a null pointer and crashed writing through it (issue 1697). The supported build only.
+  calls of f_80522050, its GPU memory (GPU_ALLOC_SITES), its two tryAllocs of CPU buffers (HEAP_ALLOC_SITES), and (Longshot
+  #2452) the tryAllocs of the objects and buffers made for it further down (OBJECT_ALLOC_SITES). They went on with a null
+  pointer and crashed writing through it (issues 1697, 2437). One that came from a parent hands the rest of its build to that
+  parent, and f_804566e0's two reads of its heap get the build's own (REST_OWN_SITES, REST_END_SITES). The supported build only.
 - The Voice Language option kept after a restart (host/oot_voice.c): the voice resource's update (f_80a9ca30) asks
   GameDataMgr whether the option was written (f_80a9d1c0) and applies it only then; option.sav's value replaces the
   option without a write, so a saved choice was never applied (issue 430). The call goes through hos_oot_voice_option,
@@ -1010,33 +1012,72 @@ GPU_ALLOC_SITES = (0x80456f1c, 0x80457098)   # (the calls' return addresses)
 GPU_ALLOC_OLD = "c->x[30] = %#xULL; f_80522050(c);"
 GPU_ALLOC_NEW = "c->x[30] = %#xULL; hos_oot_gpu_alloc(c, f_80522050);   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */"
 GPU_ALLOC_DECL = "void hos_oot_gpu_alloc(Ctx *A64_NOESC c, A64Fn game);\n"
-# f_804566e0's tryAllocs of the CPU buffers at its MatBlock's +200 (its bump allocator's memory) and +168, each sized for the
-# model (x0 the heap, x1 the size, x2 the alignment): a null result tried in the heap's parents (hos_oot_heap_retry)
-HEAP_ALLOC_SITES = (0x80456910, 0x80456da4)
+# (2026-11-25, Longshot #2452, nightly-805) The CPU allocations of a material block's build, each a heap's tryAlloc (x0 the
+# heap, x1 the size, x2 the alignment) whose result the game does not check: a null one is tried in the heap's parents
+# (hos_oot_heap_retry), and the parent that had room is written to the heaps' holder, so what the build takes afterwards comes
+# from it. A place is its call's return address and the way it reads the holder (the +8 of which is the heap it has just
+# loaded); hos_oot_heap_refuse is the test switches' (HOS_GPU_ALLOC_TEST_FAIL, HOS_GPU_ALLOC_TEST_FILL). The call's text is
+# the same at each.
+# f_804566e0's two buffers, at its MatBlock's +200 (its bump allocator's memory) and +168, each sized for the model; the
+# holder is its second argument, kept at sp+56
+HEAP_ALLOC_SITES = ((0x80456910, "recomp_load64(c, c->x[31] + 56)"), (0x80456da4, "recomp_load64(c, c->x[31] + 56)"))
 HEAP_ALLOC_OLD = "{ uint64_t _t = c->x[8]; c->x[30] = %#xULL; A64_ICALL(c, _t); }\n"
-HEAP_ALLOC_NEW = ("{ const uint64_t _hh = c->x[0], _hn = c->x[1], _ha = c->x[2];   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */\n"
-                  "  if (hos_oot_heap_refuse()) c->x[0] = 0;\n"
+HEAP_ALLOC_NEW = ("{ const uint64_t _hh = c->x[0], _hn = c->x[1], _ha = c->x[2], _ho = %s;   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */\n"
+                  "  if (hos_oot_heap_test_enabled && hos_oot_heap_refuse(c, _hh, _ho, %#xULL)) c->x[0] = 0;\n"
                   "  else { uint64_t _t = c->x[8]; c->x[30] = %#xULL; A64_ICALL(c, _t); }\n"
-                  "  if (!c->x[0]) hos_oot_heap_retry(c, _hh, _hn, _ha, %#xULL); }\n")
-HEAP_ALLOC_DECL = "int hos_oot_heap_refuse(void);\nvoid hos_oot_heap_retry(Ctx *c, uint64_t heap, uint64_t size, uint64_t align, uint64_t lr);\n"
+                  "  if (!c->x[0]) hos_oot_heap_retry(c, _hh, _hn, _ha, %#xULL, _ho); }\n")
+HEAP_ALLOC_DECL = ("extern int hos_oot_heap_test_enabled;\n"
+                   "int hos_oot_heap_refuse(Ctx *c, uint64_t heap, uint64_t holder, uint64_t lr);\n"
+                   "void hos_oot_heap_retry(Ctx *c, uint64_t heap, uint64_t size, uint64_t align, uint64_t lr, uint64_t holder);\n")
+# (PS5 port) The text the version before #2452 wrote at the two buffers, and its declarations: a lift patched by it is
+# upgraded in place (HEAP_ALLOC_V1 -> HEAP_ALLOC_NEW), so this file can run again over that lift without a new lift
+HEAP_ALLOC_V1 = ("{ const uint64_t _hh = c->x[0], _hn = c->x[1], _ha = c->x[2];   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */\n"
+                 "  if (hos_oot_heap_refuse()) c->x[0] = 0;\n"
+                 "  else { uint64_t _t = c->x[8]; c->x[30] = %#xULL; A64_ICALL(c, _t); }\n"
+                 "  if (!c->x[0]) hos_oot_heap_retry(c, _hh, _hn, _ha, %#xULL); }\n")
+HEAP_ALLOC_V1_DECL = "int hos_oot_heap_refuse(void);\nvoid hos_oot_heap_retry(Ctx *c, uint64_t heap, uint64_t size, uint64_t align, uint64_t lr);\n"
+# What f_804566e0 reaches through f_8044cb30 and f_8044db80, each handing the holder down as its last argument:
+# f_8044f420's 0x238-byte object for each entry of its list (0x8044f66c; the holder is x21), cleared at once (Longshot issue
+# 2437: write guest 0x20, thread OptimizeChangeBanc, lr 0x8044f684); the two buffers f_8044ed60 takes for that object (the
+# holder is x22 there); f_80443000's buffer and its 0x310-byte object (the holder is its fourth argument, kept at sp+0)
+OBJECT_ALLOC_SITES = ((0x8044f670, "c->x[21]"), (0x8044efc8, "c->x[22]"), (0x8044f074, "c->x[22]"),
+                      (0x80443200, "recomp_load64(c, c->x[31] + 0)"), (0x80443e30, "recomp_load64(c, c->x[31] + 0)"))
+# f_804566e0's two reads of its heap, the heap's getFreeSize before and after for the MatBlock's count of the memory the
+# build took (0x80456928 and 0x80457188): a build handed to a parent has its own heap read both times
+# (hos_oot_heap_rest_own, hos_oot_heap_rest_end, which also puts it back in the holder). The call's text is
+# HEAP_ALLOC_OLD's again, kept as it is with one line before it
+REST_OWN_SITES = (0x8045692c,)
+REST_END_SITES = (0x8045718c,)
+REST_NEW = ("    hos_oot_heap_rest_%s(c, recomp_load64(c, c->x[31] + 56));   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */\n"
+            + HEAP_ALLOC_OLD)
+REST_DECL = "void hos_oot_heap_rest_own(Ctx *c, uint64_t holder);\nvoid hos_oot_heap_rest_end(Ctx *c, uint64_t holder);\n"
 
 
 def patch_heap_retry(s):
-    """The four places above in one file's text: (text, [GPU sites, CPU sites] made now or found made). apply() wants
-    [2, 2] over the whole lift and warns otherwise"""
-    found = [0, 0]
+    """The places above in one file's text: (text, [GPU sites, the two buffers, the other allocations, the two reads] made
+    now or found made). apply() wants [2, 2, 5, 2] over the whole lift and warns otherwise"""
+    found = [0, 0, 0, 0]
     decls = []
-    for kind, sites, old, new, decl in ((0, GPU_ALLOC_SITES, GPU_ALLOC_OLD, GPU_ALLOC_NEW, GPU_ALLOC_DECL),
-                                        (1, HEAP_ALLOC_SITES, HEAP_ALLOC_OLD, HEAP_ALLOC_NEW, HEAP_ALLOC_DECL)):
-        for lr in sites:
-            o, n = old % lr, (new % lr if kind == 0 else new % (lr, lr))
-            if n in s:
-                found[kind] += 1
-            elif s.count(o) == 1 and s.count('#include "a64.h"\n') == 1:
-                s = s.replace(o, n, 1)
-                found[kind] += 1
-                if decl not in decls:
-                    decls.append(decl)
+    # (PS5 port) the two buffers as the version before #2452 patched them: brought to today's text first
+    for lr, holder in HEAP_ALLOC_SITES:
+        v1 = HEAP_ALLOC_V1 % (lr, lr)
+        if s.count(v1) == 1:
+            s = s.replace(v1, HEAP_ALLOC_OLD % lr, 1)
+            if HEAP_ALLOC_V1_DECL in s:
+                s = s.replace(HEAP_ALLOC_V1_DECL, "", 1)
+    places = [(0, GPU_ALLOC_OLD % lr, GPU_ALLOC_NEW % lr, GPU_ALLOC_DECL) for lr in GPU_ALLOC_SITES]
+    places += [(kind, HEAP_ALLOC_OLD % lr, HEAP_ALLOC_NEW % (holder, lr, lr, lr), HEAP_ALLOC_DECL)
+               for kind, sites in ((1, HEAP_ALLOC_SITES), (2, OBJECT_ALLOC_SITES)) for lr, holder in sites]
+    places += [(3, HEAP_ALLOC_OLD % lr, REST_NEW % (which, lr), REST_DECL)
+               for which, sites in (("own", REST_OWN_SITES), ("end", REST_END_SITES)) for lr in sites]
+    for kind, o, n, decl in places:
+        if n in s:
+            found[kind] += 1
+        elif s.count(o) == 1 and s.count('#include "a64.h"\n') == 1:
+            s = s.replace(o, n, 1)
+            found[kind] += 1
+            if decl not in decls:
+                decls.append(decl)
     for decl in decls:
         if decl not in s:
             s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + decl, 1)
@@ -1193,6 +1234,57 @@ def patch_sprint_stance(source):
     return _sprint_hook(source, SPRINT_STANCE_HEAD, SPRINT_STANCE_AT, SPRINT_STANCE_CALL)
 
 
+# (PG1, 2026-11-27, PS5 port) Null guards in the actor-processing jobs' loops. Two crashes on the base PS5 in the game's job threads
+# while an area loaded (66.log BaseProcExecutor0, read guest 0x108; 69.log BaseProcExecutor1, read guest 0xd0), both under
+# f_800b73d0 > f_82c3d740 > f_800eb9c0, with virtual cores off (HOS_VCORES=0: the game's per-core job data shared by threads):
+# - f_800f9cb0 walks a list of entries (x20, 8 bytes each, to x24); each entry's +160 (x23) was tested for null once, and then read
+#   through at +256, +264 and handed to f_83227280: x23 was null at the +264 read. A null x23 now takes the loop's next entry
+#   (L_800fa10c) at each of those places;
+# - f_800fb340 walks an array of pointers (x24 to x26): the entry (x22) and its +208 (x19) were read with no test, and an entry was
+#   null. A null one now takes the next entry (L_800fc0a0).
+# The game refills these lists each frame: an entry skipped once is processed at the next. hos_oot_proc_guard counts and logs them.
+PG_DECL = "extern void hos_oot_proc_guard(int site);\n"
+PG_MARK = "/* (nx2/oot_patches.py PG1) */"
+PG_SITES = [
+    ("void f_800f9cb0(Ctx *__restrict A64_NOESC c) {\n", [
+        ("L_800fa11c:;\nif (!((c->n == c->v) && !c->z)) { { A64_POLL(c); goto L_800fa004; } }\n",
+         "    if (!c->x[23]) { hos_oot_proc_guard(1); goto L_800fa10c; }   %s\n"),
+        ("L_800fa16c:;\n", "    if (!c->x[23]) { hos_oot_proc_guard(2); goto L_800fa10c; }   %s\n"),
+        ("L_800fa198:;\n", "    if (!c->x[23]) { hos_oot_proc_guard(3); goto L_800fa10c; }   %s\n"),
+    ]),
+    ("void f_800fb340(Ctx *__restrict A64_NOESC c) {\n", [
+        ("L_800fc0ac:;\n    c->x[22]=recomp_load64(c,c->x[24] + 0);\n",
+         "    if (!c->x[22]) { hos_oot_proc_guard(4); goto L_800fc0a0; }   %s\n"),
+        ("    if (!c->x[22]) { hos_oot_proc_guard(4); goto L_800fc0a0; }   " + "/* (nx2/oot_patches.py PG1) */" + "\n    c->x[19]=recomp_load64(c,c->x[22] + 208);\n",
+         "    if (!c->x[19]) { hos_oot_proc_guard(5); goto L_800fc0a0; }   %s\n"),
+    ]),
+]
+
+
+def patch_proc_guard(s):
+    """PG1's guards: (s, how many of the 5 places are in s with one, made now or before). A place whose text differs is left out"""
+    found = 0
+    for head, places in PG_SITES:
+        at = _function(s, head)
+        if at is None:
+            continue
+        start, end = at
+        body = s[start:end]
+        for old, guard in places:
+            line = guard % PG_MARK
+            if old + line in body:
+                found += 1
+                continue
+            if body.count(old) != 1:
+                continue
+            body = body.replace(old, old + line, 1)
+            found += 1
+        s = s[:start] + body + s[end:]
+    if found and PG_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + PG_DECL, 1)
+    return s, found
+
+
 def patch_file(s, name, protect_hearts=False):
     """One lifted file's patches (apply(), and nx2/chunks.py edit_c, a process per file): (its text, the places counted in it, the
     lines to print). The counts add up over the files; report() decides from the sums"""
@@ -1335,9 +1427,11 @@ def patch_file(s, name, protect_hearts=False):
     counts["step sites"] += out.count(STEP_MARK)   # (made now, or by an earlier run over this file)
     if sites:
         lines.append("oot_patches: the frame's time at %d step divide(s) in %s" % (sites, name))
-    heap, found = patch_heap_retry(out) if protect_hearts else (out, [0, 0])
+    heap, found = patch_heap_retry(out) if protect_hearts else (out, [0, 0, 0, 0])
     counts["heap GPU sites"] += found[0]
     counts["heap CPU sites"] += found[1]
+    counts["heap object sites"] += found[2]
+    counts["heap rest sites"] += found[3]
     if heap != out:
         lines.append("oot_patches: heap-full retries of the OptimizeChangeBank allocations in " + name)
     out = heap
@@ -1380,6 +1474,11 @@ def patch_file(s, name, protect_hearts=False):
     if barrier != out:
         lines.append("oot_patches: the job barriers' sleeps and mask ORs through the host in " + name)
     out = barrier
+    guard, found = patch_proc_guard(out)   # (PG1)
+    counts["proc guards"] += found
+    if guard != out:
+        lines.append("oot_patches: null guards in the actor jobs' loops (PG1) in " + name)
+    out = guard
     return out, counts, lines
 
 
@@ -1411,17 +1510,21 @@ def report(paths, counts, protect_hearts=False):
         done[what] = total[what]
     speed_hooks = total["speed hooks"]   # (SPEED_PLACES', in one file or several)
     camera_speed = total["camera speed"]   # (the turn-speed functions that scale by hos_camera_scale: patch_camera_speed)
-    heap_sites = [total["heap GPU sites"], total["heap CPU sites"]]   # (patch_heap_retry, the supported build only)
+    # (patch_heap_retry, the supported build only: its functions)
+    heap_sites = [total["heap GPU sites"], total["heap CPU sites"], total["heap object sites"], total["heap rest sites"]]
     if total["preload choice"] != 1:   # (longshot #1814: without it HOS_OCB_HOLD_MS does nothing: a flickering choice reloads the neighbours)
         print("oot_patches: WARNING: the preload manager's choice was found %d times, not once" % total["preload choice"])
     if total["light stamp"] != 1:   # (2026-11-21: without it HOS_LIGHT_LAG does nothing: a light whose record is late goes out)
         print("oot_patches: WARNING: the light records' frame-stamp test was found %d times, not once" % total["light stamp"])
     if total["texture compaction"] != 1:   # (longshot #1478: without it HOS_TEX_COMPACT_MS does nothing: the game compacts at every frame)
         print("oot_patches: WARNING: the texture heap's compaction request was found %d times, not once" % total["texture compaction"])
+    if total["proc guards"] != 5:   # (PG1: without them a null entry in those loops crashes, as in 66.log and 69.log)
+        print("oot_patches: WARNING: the actor jobs' null guards were found at %d of 5 places" % total["proc guards"])
     if total["job barrier waits"] != len(BARRIER_SITES):   # (longshot #1662: without them the job barriers sleep 20 us, as before)
         print("oot_patches: WARNING: the job barriers were found in %d of %d functions"
               % (total["job barrier waits"], len(BARRIER_SITES)))
-    if protect_hearts and heap_sites != [len(GPU_ALLOC_SITES), len(HEAP_ALLOC_SITES)]:   # (the supported build's functions)
+    if protect_hearts and heap_sites != [len(GPU_ALLOC_SITES), len(HEAP_ALLOC_SITES), len(OBJECT_ALLOC_SITES),
+                                         len(REST_OWN_SITES) + len(REST_END_SITES)]:
         print("oot_patches: WARNING: the OptimizeChangeBank allocations were found %s times, not once each: a full heap is "
               "not tried again" % heap_sites)
     step_sites = total["step sites"]   # (the divides with the hook)

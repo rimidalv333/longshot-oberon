@@ -73,9 +73,17 @@ struct site {
     uint64_t made;
     uint32_t samples;
     uint8_t depth, used;
+    uint64_t maxn;   /* (HF1) the largest request sampled for it */
 };
 static struct site sites[SITES];
 static int64_t last_live[SITES];
+static uint64_t last_made[SITES];   /* (HF1) */
+/* (2026-11-26, HF1) every allocation by size class, not sampled: count and bytes since the last report (under 1 KB, 16 KB,
+   256 KB, 4 MB, larger). The heap is dlmalloc mspaces that give back only an arena's free top and whole free segments, so
+   blocks made and freed between long-lived ones leave holes held mapped: 46.log, 180 -> 480 MiB mapped but free */
+#define CLASSES 5
+static uint64_t class_n[CLASSES], class_bytes[CLASSES];
+static inline int class_of(size_t n) { return n < 1024 ? 0 : n < (16u << 10) ? 1 : n < (256u << 10) ? 2 : n < (4u << 20) ? 3 : 4; }
 static int site_lock;
 static unsigned sites_n;
 
@@ -159,6 +167,11 @@ static int slot_put(void *p, uint32_t site, uint64_t w) {
 
 static __attribute__((noinline)) void note_alloc(void *p, size_t n) {
     if (!p || !__atomic_load_n(&prof_on, __ATOMIC_RELAXED)) return;
+    {
+        const int c = class_of(n);
+        __atomic_fetch_add(&class_n[c], 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&class_bytes[c], (uint64_t)n, __ATOMIC_RELAXED);
+    }
     if (__atomic_sub_fetch(&g_left, (int64_t)n, __ATOMIC_RELAXED) > 0) return;
     /* (a sample under way, on this thread (the unwinder's own allocation) or another: this one is not taken) */
     if (__atomic_exchange_n(&g_sampling, 1, __ATOMIC_ACQUIRE)) return;
@@ -173,6 +186,10 @@ static __attribute__((noinline)) void note_alloc(void *p, size_t n) {
     } else {
         __atomic_fetch_add(&sites[s].made, w, __ATOMIC_RELAXED);
         __atomic_fetch_add(&sites[s].samples, 1, __ATOMIC_RELAXED);
+        {
+            uint64_t m = __atomic_load_n(&sites[s].maxn, __ATOMIC_RELAXED);
+            while (n > m && !__atomic_compare_exchange_n(&sites[s].maxn, &m, (uint64_t)n, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        }
         if (slot_put(p, s, w)) {
             __atomic_fetch_add(&sites[s].live, (int64_t)w, __ATOMIC_RELAXED);
             __atomic_fetch_add(&live_samples, 1, __ATOMIC_RELAXED);
@@ -305,6 +322,44 @@ static void *heap_report(void *arg) {
                              (long long)(live[chosen[k]] >> 20), (long long)(grew / (1 << 20)),
                              (unsigned long long)(__atomic_load_n(&s->made, __ATOMIC_RELAXED) >> 20),
                              __atomic_load_n(&s->samples, __ATOMIC_RELAXED), pcs);
+        }
+        /* (HF1) what was made and freed again since the last report, by size class and by caller: the churn that fragments */
+        {
+            static const char *const names[CLASSES] = {"<1K", "<16K", "<256K", "<4M", ">=4M"};
+            char line[400];
+            int m = 0;
+            for (int c = 0; c < CLASSES; c++) {
+                const uint64_t cn = __atomic_exchange_n(&class_n[c], 0, __ATOMIC_RELAXED);
+                const uint64_t cb = __atomic_exchange_n(&class_bytes[c], 0, __ATOMIC_RELAXED);
+                m += snprintf(line + m, sizeof line - (size_t)m, "%s %s %llu (%llu MiB)", c ? ";" : "", names[c],
+                              (unsigned long long)cn, (unsigned long long)(cb >> 20));
+            }
+            hos_ps5_klog_now("[ps5] heap churn: allocations since the last report by size:%s; mapped %llu MiB, in use %llu MiB, "
+                             "free inside %llu MiB, %u segments, %u arenas", line, (unsigned long long)(st.mapped_bytes >> 20),
+                             (unsigned long long)(st.in_use_bytes >> 20),
+                             (unsigned long long)((st.mapped_bytes - st.in_use_bytes) >> 20), st.segments, st.arenas);
+            int64_t freed[SITES];
+            for (unsigned i = 0; i < SITES; i++) {
+                if (!sites[i].used) { freed[i] = 0; continue; }
+                const uint64_t made = __atomic_load_n(&sites[i].made, __ATOMIC_RELAXED);
+                freed[i] = (int64_t)(made - last_made[i]) - (live[i] - last_live[i]);
+                last_made[i] = made;
+            }
+            for (int k = 0; k < 10; k++) {
+                int best = -1;
+                for (unsigned i = 0; i < SITES; i++)
+                    if (freed[i] > 0 && (best < 0 || freed[i] > freed[best])) best = (int)i;
+                if (best < 0 || freed[best] < (4 << 20)) break;
+                const struct site *s = &sites[best];
+                char pcs[200];
+                int q = 0;
+                for (int i = 0; i < s->depth && q < (int)sizeof pcs - 20; i++)
+                    q += snprintf(pcs + q, sizeof pcs - (size_t)q, " %llx", (unsigned long long)(s->pc[i] - base));
+                hos_ps5_klog_now("[ps5] heap churn site %d: ~%lld MiB made and freed again, largest block %llu KB, %lld MiB live:%s", k + 1,
+                                 (long long)(freed[best] >> 20), (unsigned long long)(__atomic_load_n(&s->maxn, __ATOMIC_RELAXED) >> 10),
+                                 (long long)(live[best] >> 20), pcs);
+                freed[best] = 0;
+            }
         }
         for (unsigned i = 0; i < SITES; i++) last_live[i] = live[i];
         if (hos_ps5_heap_extra) hos_ps5_heap_extra();

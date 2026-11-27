@@ -385,8 +385,48 @@ static void input_room(Dec *d) {
     if (full && !d->ready_clear) d->ready_clear = 1, hos_system_event_clear(d->ready);
     else if (!full && d->ready_clear) d->ready_clear = 0, hos_system_event_signal(d->ready);
 }
+/* (2026-11-26, HK2) RX_VK_HEAP_KEEP2 (on; =0 off): a decoded picture's NV12 buffer goes back to a bin of four and the next
+   picture of that size takes it, not a new block of w*h*3/2 (3 MB at 1080p) made for every picture and freed once it is copied
+   into the game's pool: 49.log's heap churn, ~1.3 GB a run in 3 MB blocks, between the heap's long-lived ones. At most four
+   buffers held (12 MB at 1080p) */
+#define NV12_BIN 4
+static volatile LONG nv12_bin_lock;
+static uint8_t *nv12_bin[NV12_BIN];
+static size_t nv12_bin_size[NV12_BIN];
+static int video_keep(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RX_VK_HEAP_KEEP2");
+        v = !e || atoi(e) != 0;   /* (on since 50.log; =0 off) */
+    }
+    return v;
+}
+static uint8_t *nv12_take(size_t n) {
+    if (video_keep()) {
+        uint8_t *got = NULL;
+        while (InterlockedExchange(&nv12_bin_lock, 1)) {}
+        for (int i = 0; i < NV12_BIN && !got; i++)
+            if (nv12_bin[i] && nv12_bin_size[i] == n) got = nv12_bin[i], nv12_bin[i] = NULL;
+        InterlockedExchange(&nv12_bin_lock, 0);
+        if (got) return got;
+    }
+    return (uint8_t *)malloc(n);
+}
+static void nv12_give(uint8_t *b, size_t n) {
+    if (!b) return;
+    if (video_keep()) {
+        int kept = 0;
+        while (InterlockedExchange(&nv12_bin_lock, 1)) {}
+        for (int i = 0; i < NV12_BIN && !kept; i++)
+            if (!nv12_bin[i]) nv12_bin[i] = b, nv12_bin_size[i] = n, kept = 1;
+        InterlockedExchange(&nv12_bin_lock, 0);
+        if (kept) return;
+    }
+    free(b);
+}
 static void picture_free(Picture *p) {
-    free(p->rgba), free(p->nv12);
+    free(p->rgba);
+    nv12_give(p->nv12, (size_t)p->w * p->h * 3 / 2);
     memset(p, 0, sizeof *p);
 }
 static void pending_free(Dec *d) {
@@ -434,7 +474,7 @@ static void queue_frame(Dec *d, const AVFrame *f) {
     p.w = w, p.h = h, p.pts = f->pts;
     const size_t nv12_size = (size_t)w * h * 3 / 2;
     p.rgba = lazy_rgba ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
-    p.nv12 = (uint8_t *)malloc(nv12_size);
+    p.nv12 = nv12_take(nv12_size);   /* (HK2) */
     if (!p.nv12 || (!lazy_rgba && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
         static volatile LONG told;
         if (InterlockedIncrement(&told) <= 4) hos_log("video: no memory for a %dx%d frame: dropped", w, h);

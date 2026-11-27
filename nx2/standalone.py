@@ -115,6 +115,11 @@ def hle_set(modules):
 
 
 def demangle(syms):
+    # (2026-11-27, WB1) the stubs' comments name each symbol as it is mangled, unless A64_DEMANGLE=1: llvm-cxxfilt was taken from
+    # whatever PATH had (a WSL with LLVM installed: demangled; the release's tools and Windows have none: mangled), so the same
+    # zip lifted to a different a64_stubs.c on different PCs, and a different eboot.bin
+    if os.environ.get("A64_DEMANGLE", "") != "1":
+        return {s: s for s in syms}
     try:
         out = subprocess.run([toolchain.find("llvm-cxxfilt")], input="\n".join(syms), capture_output=True,
                              text=True).stdout.splitlines()

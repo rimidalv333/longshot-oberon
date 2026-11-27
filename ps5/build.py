@@ -14,6 +14,7 @@ Paths: OOT_WORK (default work/lift), PS5_PAYLOAD_SDK (default .local/ps5-deps/ps
 """
 import argparse
 import concurrent.futures
+import threading
 import hashlib
 import json
 import re
@@ -31,6 +32,7 @@ import rtgen     # noqa: E402  (the 64-bit guest window's runtime header)
 import logo_rgba  # noqa: E402
 import ui_fonts   # noqa: E402  (the overlays' bundled fonts, compiled in)
 import version   # noqa: E402
+import fp_native  # noqa: E402  (RX_FP_NATIVE: the lifted code's floats as host floats, nx2/fp_native.py)
 
 # (the SDK ps5/build-title.sh installs at its pinned revision; before it did, PS5_VulkanTemplate's)
 SDK = os.environ.get("PS5_PAYLOAD_SDK") or next(
@@ -58,6 +60,10 @@ HAS_MIHAWKGEN = all(os.path.exists(f) for f in MIHAWKGEN_SOURCES + [MIHAWKGEN_NE
 # required flags (PS5_Vulkan tooling/prospero-clang18). Frame pointers: console backtraces walk them.
 COMMON = ["-march=znver2", "-ffp-contract=off", "-DA64_HOST_BASE=0x1000000000ULL", "-fno-omit-frame-pointer",
           "-ffunction-sections", "-fdata-sections", "-g0", "-Wno-everything"]
+# (2026-11-27, WB1) The title the same wherever it is built: a __FILE__ (Eden's asserts, the texture decoders') names the file
+# from the tree's root ("./gpu/..."), in the target's separators, not the folder the tree was unpacked to or the build's system:
+# a Linux or WSL build and the Windows builder (build.cmd) make the same eboot.bin from the same zip
+COMMON += sorted({"-ffile-prefix-map=%s=." % r for r in (ROOT, os.path.realpath(ROOT))}) + ["-ffile-reproducible"]
 
 # (base PS5) Native thread-local storage for the host and the renderer: the wrapper's -femulated-tls makes every thread_local
 # access a call to __emutls_get_address (pthread_getspecific and an index), and the replay's hot path, on the one thread that
@@ -93,6 +99,12 @@ def llvm_major(cmd):
 
 
 def cc_wrapper(cxx=False):
+    if os.name == "nt":   # (WB1, the Windows builder: PS5_Vulkan's tooling/prospero-clang18 is a sh script; its flags, as it has them)
+        sdk = os.environ.get("PS5_PAYLOAD_SDK") or SDK
+        return [os.environ.get("PS5_CLANG") or "clang", "-target", "x86_64-sie-ps5", "-fvisibility-nodllstorageclass=default",
+                "-isysroot", sdk, "-isystem", os.path.join(sdk, "target", "include", "c++", "v1"),
+                "-isystem", os.path.join(sdk, "target", "include"), "-fno-stack-protector", "-fno-plt", "-femulated-tls",
+                "-fdenormal-fp-math=ieee"] + (["-x", "c++"] if cxx else [])
     return ["sh", os.path.join(VULKAN, "tooling", "prospero-clang18")] + (["-x", "c++"] if cxx else [])
 
 
@@ -130,6 +142,17 @@ def jobs_for(rt64, gen_dir):
     """(source, object, flags, header digest) of everything the title links"""
     out = []
     game_digest = tree_digest(GEN, rt64, os.path.join(kit.KIT, "rt"), os.path.join(ROOT, "nx2", "rt"))
+    # (2026-11-26, after Longshot #2235) RX_FP_NATIVE=1: native copies of the lift's two float headers (every FPSR keep test
+    # true, the vector routes' bad lanes and the fast regions' MXCSR window gone), found before the lift's own by the game's
+    # chunks and the host. Off by default; switching it compiles every game object again (their flags and digest change)
+    fp_inc, fp_digest = [], ""
+    if fp_native.on() and all(os.path.isfile(os.path.join(GEN, h)) for h in fp_native.HEADERS):
+        fp_dir = fp_native.write(GEN, os.path.join(OUT, "fp-native"))
+        fp_inc, fp_digest = ["-I" + fp_dir], tree_digest(fp_dir)
+        if not getattr(jobs_for, "told_fp", False):
+            jobs_for.told_fp = True
+            print("ps5: RX_FP_NATIVE: the lifted code's floats are host floats, no FPSR bookkeeping (nx2/fp_native.py)", flush=True)
+    game_digest += fp_digest
     # (base PS5) the PC build compiles its hot code at -O2 with a play profile and orders it at the link (nx2/build.py); the
     # console's had -O1 throughout. PS5_GAME_OPT=O2: the whole game at -O2 (a longer first build). PS5_PGO=<.profdata>: built
     # with that profile; it must be readable by the console's clang (18): `llvm-profdata merge --text` with the newer tool, then
@@ -141,12 +164,23 @@ def jobs_for(rt64, gen_dir):
     mark_bitmap = [] if os.environ.get("RX_MARK_BITMAP", "").strip().lower() in ("0", "off", "false", "no") else ["-DA64_MARK_BITMAP"]
     pgo = os.environ.get("PS5_PGO")
     pgo_fl = []
-    if pgo:
+    if pgo == "gen":
+        # (2026-11-27, PG1) PS5_PGO=gen: the lifted game counts its branches too, as the renderer does with PS5_VK_PGO=gen: one
+        # module on the console, so host/pgo_rt.c (built in for either) writes both modules' counters in the one file
+        # (HOS_PGO=<file>); `llvm-profdata merge` (deps/llvm, 18) of it serves PS5_PGO and PS5_VK_PGO alike
+        pgo_fl = ["-fprofile-instr-generate", "-mllvm", "-disable-vp=true"]
+        print("ps5: the game counts its branches for a profile (PS5_PGO=gen; HOS_PGO=<file> in the env file)", flush=True)
+    elif pgo:
         with open(pgo, "rb") as fh:
             pgo_fl = ["-fprofile-instr-use=" + os.path.abspath(pgo), "-Wno-profile-instr-unprofiled", "-Wno-profile-instr-out-of-date",
                       "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(fh.read()).hexdigest()[:16]]
-    game_fl = COMMON + ["-I" + rt64, "-I" + GEN, "-I" + os.path.join(kit.KIT, "rt"), "-I" + os.path.join(ROOT, "nx2", "rt"),
-                        "-fno-strict-aliasing", "-mcx16", game_opt] + pgo_fl + ["-mllvm", "-rotation-max-header-size=0", "-mllvm",
+    # (2026-11-27, PG2) the profile, counted or used, on the hot chunks only (code_hot_*: the 680 hottest functions, at -O2): the
+    # whole game counting put 103 MB of writable counters (__llvm_prf_cnts 80.7, __llvm_prf_data 22.3) beside .bss's 171.5 MB in
+    # the title's flexible memory (~92 MB free in play), and the console refused to load it (64.log: no "starts" line).
+    # PS5_PGO_ALL=1: every chunk, as PG1 did
+    pgo_all = os.environ.get("PS5_PGO_ALL", "") not in ("", "0")
+    game_fl = COMMON + fp_inc + ["-I" + rt64, "-I" + GEN, "-I" + os.path.join(kit.KIT, "rt"), "-I" + os.path.join(ROOT, "nx2", "rt"),
+                        "-fno-strict-aliasing", "-mcx16", game_opt] + (pgo_fl if pgo_all else []) + ["-mllvm", "-rotation-max-header-size=0", "-mllvm",
                         "-capture-tracking-max-uses-to-explore=5000", "-DA64_POLLING", "-DA64_WRITE_TRACK"] + mark_bitmap
     chunks = sorted(f for f in os.listdir(GEN) if f.startswith("code_") and f.endswith(".c"))
     game = [os.path.join(GEN, c) for c in chunks] + \
@@ -159,12 +193,15 @@ def jobs_for(rt64, gen_dir):
     # code_hot*.c and nothing changes
     hot_opt = "-" + os.environ.get("PS5_HOT_OPT", "O2").lstrip("-")
     hot_fl = [hot_opt if f == game_opt else f for f in game_fl]
+    if pgo_fl and not pgo_all:   # (PG2: after the opt level, where game_fl has them with PS5_PGO_ALL)
+        at = hot_fl.index(hot_opt) + 1
+        hot_fl = hot_fl[:at] + pgo_fl + hot_fl[at:]
     out += [(s, os.path.join(OUT, "obj", "game_" + os.path.basename(s)[:-2] + ".o"),
              hot_fl if os.path.basename(s).startswith("code_hot") else game_fl, game_digest) for s in game]
 
     # the runtime: host/ as Linux builds it, without SDL's loader (host/ps5/hos_sdl_ps5.c) and the Linux-only files
-    host_digest = tree_digest(HOST, rt64, GEN) + tree_digest(os.path.join(VK), ext=("vk_api.h", "dlss_math.h"))
-    host_fl = COMMON + ["-I" + POSIX, "-D_GNU_SOURCE", "-I" + HOST, "-I" + rt64, "-I" + GEN, "-O2", "-mcx16", "-DA64_POLLING",
+    host_digest = tree_digest(HOST, rt64, GEN) + tree_digest(os.path.join(VK), ext=("vk_api.h", "dlss_math.h")) + fp_digest
+    host_fl = COMMON + ["-I" + POSIX, "-D_GNU_SOURCE", "-I" + HOST] + fp_inc + ["-I" + rt64, "-I" + GEN, "-O2", "-mcx16", "-DA64_POLLING",
                         "-DA64_WRITE_TRACK", "-I" + os.path.join(OPUS, "include"), "-I" + os.path.join(FFMPEG, "include"),
                         "-I" + os.path.join(DEPS, "zstd", "include"),
                         "-I" + os.path.join(pkg("vulkanheaders", "v1.4.345"), "include")] + TLS_FL
@@ -173,7 +210,7 @@ def jobs_for(rt64, gen_dir):
     skip = {"display.c", "mf_av1.c", "rx_nowgpu.c", "hos_sdl.c", "mingw_msvc_shims.c", "msvc_oldnames.c",
             # (Longshot rc.4's crash window, a helper process the game starts, and its restart, an execve of itself: neither
             # is possible on the console, host/ps5/rc4_stubs.c answers for them)
-            "hos_crash_dialog.c", "hos_relaunch.c"} | (set() if vk_pgo == "gen" else {"pgo_rt.c"})
+            "hos_crash_dialog.c", "hos_relaunch.c"} | (set() if "gen" in (vk_pgo, os.environ.get("PS5_PGO")) else {"pgo_rt.c"})
     host = [os.path.join(HOST, f) for f in sorted(os.listdir(HOST)) if f.endswith(".c") and f not in skip] + \
         [os.path.join(POSIX, f) for f in ("win32_posix.c", "display_sdl.c", "linux_stubs.c")] + \
         [os.path.join(PS5, f) for f in sorted(os.listdir(PS5)) if f.endswith(".c")]
@@ -193,7 +230,7 @@ def jobs_for(rt64, gen_dir):
     # the Vulkan back end, Eden's recompiler and sirit, as nx2/build.py's vk_sources (C++20 with exceptions: Eden throws)
     import build as upstream   # (nx2/build.py: the source list, kept in one place)
     spirv = pkg("spirv-headers", "vulkan-sdk-1.4.341.0")
-    vfl = COMMON + ["-I" + POSIX, "-D_GNU_SOURCE", "-include", os.path.join(PS5, "win32_ps5.h"),
+    vfl = COMMON + ["-I" + POSIX, "-D_GNU_SOURCE", "-include", in_tree(os.path.join(PS5, "win32_ps5.h")),
                     "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring",
                     "-include", "functional", "-include", "string", "-include", "vector",
                     "-std=c++20", "-O2", "-DNDEBUG", "-fexceptions", "-fcxx-exceptions", "-DVK_NO_PROTOTYPES",
@@ -274,7 +311,7 @@ def jobs_for(rt64, gen_dir):
         out.append((s, os.path.join(OUT, "obj", "vk_" + rel + ".o"), fl,
                     lib_digest if lib else vk_digest + (imgui_digest if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else "")))
     if HAS_MIHAWKGEN:   # (its Vulkan calls through the back end's loaded pointers: vk_loader.h, as every unit of gpu/vk)
-        mfl = vfl + ["-include", os.path.join(VK, "vk_loader.h"), "-I" + os.path.join(MIHAWKGEN, "framegen", "include"),
+        mfl = vfl + ["-include", in_tree(os.path.join(VK, "vk_loader.h")), "-I" + os.path.join(MIHAWKGEN, "framegen", "include"),
                      "-I" + os.path.join(MIHAWKGEN, "framegen", "src")]
         mdigest = tree_digest(os.path.join(MIHAWKGEN, "framegen")) + vk_digest
         for s in MIHAWKGEN_SOURCES:
@@ -282,8 +319,18 @@ def jobs_for(rt64, gen_dir):
     return out
 
 
+def in_tree(p):
+    # (2026-11-27, WB1) a forced include named from the tree's root, in '/' form (the compiles run there: compile_one): clang
+    # writes each -include into its built-in text, so a full path shifted every later source position (inline asm's srcloc in
+    # the bitcode) by the folder's length, and the title differed with the folder it was built in
+    r = os.path.relpath(p, ROOT)
+    return r.replace(os.sep, "/") if not r.startswith("..") and not os.path.isabs(r) else p
+
+
 def key_of(src, flags, digest):
     h = hashlib.sha1(placeless(" ".join(flags)).encode() + digest.encode())
+    if "-flto=thin" in flags:   # (WB1: their bitcode names the source as compile_one gives it, relative since 2026-11-27)
+        h.update(b"src-relative")
     with open(src, "rb") as f:
         h.update(f.read())
     return h.hexdigest()
@@ -297,8 +344,25 @@ def compile_one(job):
         return src, None, 0.0
     cxx = src.endswith(".cpp")
     t = time.time()
-    r = subprocess.run(cc_wrapper(cxx) + flags + ["-c", src, "-o", obj], capture_output=True, text=True,
-                       env=dict(os.environ, PS5_PAYLOAD_SDK=SDK, PS5_CLANG=os.environ.get("PS5_CLANG") or shutil.which("clang")))
+    # (2026-11-27, WB1) the source named from the tree's root, in '/' form, run there: a ThinLTO object's bitcode keeps the source
+    # path it was given (its module's source_filename, which names its local functions), so an absolute one made the renderer's
+    # objects, and the title, differ with the folder and the system it was built in. A source outside the tree keeps its path
+    rel = os.path.relpath(src, ROOT)
+    arg = rel.replace(os.sep, "/") if not rel.startswith("..") and not os.path.isabs(rel) else src
+    # (PS5_COMPILE_TIMEOUT_S, Windows only by default (1800): a compile past it is ended and tried once more. 69 minutes of one
+    # Windows clang on code_050.c that compiles in 58 s alone: it never ended)
+    limit = float(os.environ.get("PS5_COMPILE_TIMEOUT_S", "1800" if os.name == "nt" else "0") or 0)
+    for attempt in (1, 2):
+        try:
+            r = subprocess.run(cc_wrapper(cxx) + flags + ["-c", arg, "-o", obj], capture_output=True, text=True, cwd=ROOT,
+                               env=dict(os.environ, PS5_PAYLOAD_SDK=SDK, PS5_CLANG=os.environ.get("PS5_CLANG") or shutil.which("clang")),
+                               timeout=limit or None)
+            break
+        except subprocess.TimeoutExpired:
+            print("  ... %s: no end after %d s: ended, %s" % (os.path.basename(src), limit, "trying once more" if attempt == 1 else
+                  "given up"), flush=True)
+            if attempt == 2:
+                return src, "the compile did not end in %d s, twice (PS5_COMPILE_TIMEOUT_S)" % limit, time.time() - t
     if r.returncode:
         return src, (r.stdout + r.stderr)[-4000:], time.time() - t
     if not os.path.exists(obj):   # (a compiler killed for want of memory can leave no object and no error)
@@ -333,15 +397,48 @@ def main():
     print("ps5: %d files, %d jobs; thread-local storage %s" % (len(jobs), a.jobs,
           "native (PS5_NATIVE_TLS)" if NATIVE_TLS else "emulated (PS5_NATIVE_TLS=0)"), flush=True)
     failed, built, t0 = [], 0, time.time()
+    # (2026-11-27) what is up to date is found first, so the count below is of the files that compile; each one that ends gets a
+    # line with a bar, and every 60 s the files still compiling are named (the hot chunks take minutes each)
+    def up_to_date(job):
+        src, obj, flags, digest = job
+        stamp = obj + ".key"
+        return os.path.exists(obj) and os.path.exists(stamp) and open(stamp).read() == key_of(src, flags, digest)
+    todo = [j for j in jobs if not up_to_date(j)]
+    print("ps5: %d of them to compile, %d up to date" % (len(todo), len(jobs) - len(todo)), flush=True)
+    running, lock, stop = {}, threading.Lock(), threading.Event()
+    def one(job):
+        with lock:
+            running[job[0]] = time.time()
+        try:
+            return compile_one(job)
+        finally:
+            with lock:
+                running.pop(job[0], None)
+    def heartbeat():
+        while not stop.wait(60):
+            with lock:
+                now = list(running.items())
+            if now:
+                print("  ... still compiling: " + ", ".join("%s (%dm%02ds)" % (os.path.basename(f), (time.time() - t) // 60,
+                      (time.time() - t) % 60) for f, t in sorted(now, key=lambda x: x[1])), flush=True)
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
+    done_n = 0
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        for src, err, secs in pool.map(compile_one, jobs):
+        for fut in concurrent.futures.as_completed([pool.submit(one, j) for j in todo]):
+            src, err, secs = fut.result()
+            done_n += 1
+            pct = done_n * 100 // max(1, len(todo))
+            bar = "#" * (pct // 5) + "." * (20 - pct // 5)
+            el = time.time() - t0
             if err:
                 failed.append(src)
-                print("FAILED %s\n%s" % (os.path.relpath(src, ROOT), err), flush=True)
-            elif secs:
+                print("[%s] %3d%% %d/%d FAILED %s\n%s" % (bar, pct, done_n, len(todo), os.path.relpath(src, ROOT), err), flush=True)
+            else:
                 built += 1
-                if secs > 30:
-                    print("  %s: %.0f s" % (os.path.relpath(src, ROOT), secs), flush=True)
+                print("[%s] %3d%% %d/%d %s (%.0f s; %dm%02ds so far)" % (bar, pct, done_n, len(todo), os.path.relpath(src, ROOT),
+                      secs, el // 60, el % 60), flush=True)
+    stop.set()
     print("ps5: %d compiled, %d failed (%.0f s)" % (built, len(failed), time.time() - t0), flush=True)
     if failed:
         return 1
@@ -354,7 +451,7 @@ def main():
     if order:   # (base PS5: the hot functions together, as the PC build links them; their sections are per function already)
         env["PS5_LINK_EXTRA"] = "--symbol-ordering-file=%s --no-warn-symbol-ordering" % os.path.abspath(order)
         print("ps5: functions ordered by %s" % order, flush=True)
-    if os.environ.get("PS5_VK_PGO") == "gen":
+    if "gen" in (os.environ.get("PS5_VK_PGO"), os.environ.get("PS5_PGO")):   # (PG1: the game's counting too)
         # (the console's target has clang name its profile runtime in each counting object, libclang_rt.profile-x86_64_nosubmission.a,
         # which the payload SDK has not: host/pgo_rt.c stands in for it, so those names are not followed)
         env["PS5_LINK_EXTRA"] = (env.get("PS5_LINK_EXTRA", "") + " --no-dependent-libraries").strip()
@@ -364,7 +461,8 @@ def main():
         # "bitcode version" error at the end of a long link
         cc = os.environ.get("PS5_CLANG") or shutil.which("clang") or "clang"
         cc_v = llvm_major([cc, "--version"])
-        ld_v = llvm_major([os.path.join(SDK, "bin", "prospero-llvm-config"), "--version"])
+        ld_v = llvm_major([os.environ.get("LLVM_CONFIG") or "llvm-config", "--version"] if os.name == "nt" else
+                          [os.path.join(SDK, "bin", "prospero-llvm-config"), "--version"])
         print("ps5: ThinLTO: clang %d, the linker's LLVM %d" % (cc_v, ld_v), flush=True)
         if not cc_v or not ld_v or ld_v < cc_v:
             print("ps5/build.py: PS5_VK_LTO=thin: the linker's LLVM (%d) must be the clang's (%d) or newer; build without "
@@ -387,8 +485,9 @@ def main():
             extra += " -mllvm -emulated-tls=0"
         env["PS5_LINK_EXTRA"] = (env.get("PS5_LINK_EXTRA", "") + " " + extra).strip()
         print("ps5: ThinLTO at the link (%s)" % extra, flush=True)
-    linked = subprocess.run(["bash", os.path.join(ROOT, "ps5", "tools", "link.sh"), OUT,
-                             os.path.join(kit.WORK, "sa", "image", "image.bin")], env=env).returncode
+    link_cmd = ([sys.executable, "-I", os.path.join(ROOT, "ps5", "tools", "link.py")] if os.name == "nt" else   # (WB1: link.sh's port)
+                ["bash", os.path.join(ROOT, "ps5", "tools", "link.sh")])
+    linked = subprocess.run(link_cmd + [OUT, os.path.join(kit.WORK, "sa", "image", "image.bin")], env=env).returncode
     if not linked and HAS_MIHAWKGEN:   # (the network beside the game: /app0/framegen/network.fgw, vk_framegen.cpp)
         title_id = json.load(open(os.path.join(ROOT, "ps5", "sce_sys", "param.json")))["titleId"]
         os.makedirs(os.path.join(ROOT, "dist", title_id, "framegen"), exist_ok=True)

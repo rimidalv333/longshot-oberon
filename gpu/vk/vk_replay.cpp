@@ -495,9 +495,31 @@ void recording_wait(Recording& r) {
     r.submitted = false;
 }
 
+// (longshot) RX_VK_REPLAYED_CACHE (a kill switch, on unless set off): read once, by replay_start before the timeline is made
+// and the renderer is given to the host (replayed_cache_on), so no thread reads it before it is set
+std::atomic<bool> replayed_cache{false};
+// (longshot) the timeline as any thread last read it here, from a read that succeeded: it only goes up. Kept only while
+// RX_VK_REPLAYED_CACHE is on, for the host's question how far the replay is (get_replayed)
+std::atomic<uint64_t> completed_seen{0};
+/// RX_VK_REPLAYED_CACHE read and logged (replay_start: once, at the renderer's start, before the host can ask)
+bool replayed_cache_on() {
+    const bool on = env_on("RX_VK_REPLAYED_CACHE");   // (2026-11-26, Longshot #1994 ported: off unless set, until a console run)
+    replayed_cache.store(on, std::memory_order_relaxed);
+    logf("vk: the host's question how far the replay is answered from the timeline as last read: %s (RX_VK_REPLAYED_CACHE=1: on; "
+         "unset: the driver asked at every call)", on ? "on" : "off");
+    return on;
+}
 uint64_t completed() {
     uint64_t v = 0;
-    vkGetSemaphoreCounterValue(dev.device, timeline, &v);
+    const VkResult res = vkGetSemaphoreCounterValue(dev.device, timeline, &v);
+    if (res != VK_SUCCESS) {   // (a failed read establishes nothing, whatever the driver wrote: nothing is taken as done)
+        if (res == VK_ERROR_DEVICE_LOST) device_lost();
+        return 0;
+    }
+    if (replayed_cache.load(std::memory_order_relaxed)) {
+        uint64_t was = completed_seen.load(std::memory_order_relaxed);
+        while (v > was && !completed_seen.compare_exchange_weak(was, v, std::memory_order_relaxed)) {}
+    }
     return v;
 }
 // ---- (test) RX_VK_BATCH=1: the replay's submits held and sent as one vkQueueSubmit2 ----
@@ -3723,6 +3745,18 @@ void submit_job(std::vector<uint64_t>& handles, uint64_t value, uint64_t queue) 
 uint64_t get_replayed() {
     queue_flush_poll();
     const uint64_t hold = replayed_hold.load();
+    // (longshot, RX_VK_REPLAYED_CACHE) The host asks this under its recordings' lock, held exclusively (host/nvn_native.c
+    // free_dead_copies, at every nvnCommandBufferAddControlMemory: 117 a frame in a CPU profile of Hyrule Field), to let go
+    // of the copies the GPU is past, and each answer was a call into the driver there. It is answered from the timeline as
+    // it was last read successfully (completed(): at every recording begun, every submit's memory work, every wait), and
+    // read here at the first call and every 64th after (calls the bench holds read the driver and are not counted), so that
+    // it moves when nothing replays. A lower answer keeps a copy the GPU is past until a later answer passes it: up to 63
+    // calls when nothing else reads the timeline, however long they take to come, and the copies kept meanwhile go
+    // together. The saving is not measured yet. RX_VK_REPLAYED_CACHE=0: the driver asked at every call, as before
+    if (!hold && replayed_cache.load(std::memory_order_relaxed)) {
+        static std::atomic<uint32_t> asked{0};
+        if (asked.fetch_add(1, std::memory_order_relaxed) & 63) return completed_seen.load(std::memory_order_relaxed);
+    }
     return hold ? std::min(hold, completed()) : completed();
 }
 /// (longshot) Waits for the recording submission value f (or the recording of value f) was finished in, on the recordings'
@@ -4686,7 +4720,14 @@ void invalidate(uint64_t gpu, uint64_t size) {
                 vkGetSemaphoreCounterValue(dev.device, rec_timeline, &l_done);
             }
             const bool pending = v > completed(), newest = pending && v >= f0;
-            const bool late = pending && readback_late_wanted(size, newest);   // (RX_VK_READBACK_LATE: read without its wait)
+            // (MW1, 2026-11-27) Never OoT's exposure meter: `newest` let its read go before the frame's sums landed, the game read
+            // zero or old sums and stepped its exposure up and down, a whole-picture pulse every ~6 frames over water, a waterfall,
+            // glass lit by Navi (the user's videos of 2026-11-27: 79 -> 72 of 255 and back, the waterfall ~36 brighter; the same
+            // with RX_VK_CUBEMAP_EVERY=1). readback_late.h warns of it; the meter's block (0x1040, memory_is_meter) waits as it did
+            // before the switch. RX_VK_METER_WAIT=0: read late with the rest, as before
+            static const bool meter_wait = !getenv("RX_VK_METER_WAIT") || atoi(getenv("RX_VK_METER_WAIT")) != 0;
+            const bool late = pending && readback_late_wanted(size, newest) &&
+                              !(meter_wait && size == 0x1040 && memory_is_meter(host->gpu_guest(gpu)));   // (RX_VK_READBACK_LATE)
             if (rb_writers_on() && pending && !late && !rb_probe_only())
                 rb_diag_wait(gpu, size, rbd, whole, part, unforced && by_part && whole > completed());
             // (longshot) RX_VK_READBACK_EARLY (on where no pool has a mirror): pages written in place (the Steam Deck's every page) wait for
@@ -5344,6 +5385,7 @@ uint64_t made_ring[32];
 int64_t made_ring_present = 0;
 void log_frame_stats() {
     log_slow_frame();
+    pipeline_area_present();
     made_ring[presents % 32] = texture_made();
     made_ring_present = presents;
     if (presents % 600 == 0) programs_census_log("play");
@@ -5486,6 +5528,7 @@ void log_frame_stats() {
 void status_tick() {
     namespace sl = status_line;
     kept_ready_sweep();   // (KR1: vk_draw.cpp)
+    program_cache_redrop();   // (MR1: vk_progcache.cpp; nothing unless RX_VK_MODULE_REDROP_S)
     static uint64_t frames = 0;
     // (the slowest frame since the last line, present to present: a stall shows here, to be matched with what the log says
     // around it, such as DLSS's feature made again)
@@ -7953,6 +7996,7 @@ uint32_t early_check_collect_begin() { return early_check_on() ? ++ec_full_begun
 bool replay_start() {
     menu_init();
     if (!memory_init() || !vma_init(instance_proc())) return false;
+    replayed_cache_on();   // (once, before the timeline and the host's first question: see get_replayed)
     VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo tsi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};

@@ -723,7 +723,12 @@ void memory_sync() {
     generation = g;
     static thread_local std::vector<std::array<uint64_t, 2>> list(8192);
     const int n = host->gpu_pools(reinterpret_cast<uint64_t(*)[2]>(list.data()), (int)list.size());
+    // (2026-11-26, HK1, RX_VK_HEAP_KEEP; =0 off) the table made into the one replaced last time, kept: not a new ~140 KB block every
+    // change of the mappings and the old one freed (47.log: ~1.1 GB a run made and freed here). Under sync_mu
+    static std::vector<GuestPool> spare;
+    static const bool keep = [] { const char* e = getenv("RX_VK_HEAP_KEEP"); return !e || atoi(e) != 0;   /* (on since 49.log) */ }();
     std::vector<GuestPool> next;
+    if (keep) next.swap(spare), next.clear();
     next.reserve(n > 0 ? (size_t)n : 0);
     for (int i = 0; i < n; i++) {
         if (!list[i][1]) continue;
@@ -742,6 +747,7 @@ void memory_sync() {
     std::lock_guard lk(pools_mu);
     memsync_lock_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w1).count();
     guest_pools.swap(next);
+    if (keep) spare.swap(next);   // (the old table, now in next: under pools_mu still, which its readers hold)
     guest_pools_gen.fetch_add(1, std::memory_order_relaxed);
     last_pool = nullptr;
     std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
@@ -3617,7 +3623,13 @@ void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {
 bool mirror_on();
 uint64_t import_chunk() {
     static const uint64_t chunk =
-        (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : mirror_on() ? 4 : 16) << 20;
+        (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB")))
+#ifdef __PROSPERO__   // (2026-11-26, IC2: 4 on the PS5, where an import pins its units: 53.log, 1.1-1.3 GB imported against 2.0-2.9 with 16)
+                                                   : 4
+#else
+                                                   : mirror_on() ? 4 : 16
+#endif
+                   ) << 20;
     return chunk;
 }
 /// (longshot) A game pool across a chunk's end had each chunk imported on its own, at the first binding in it, and a later
@@ -4714,10 +4726,12 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     return true;
 }
 
+void memory_census_buffer(uint64_t guest, uint64_t size);   // (IC1, below)
 BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
     uint64_t avail = 0;
     if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};
     const uint64_t guest = host->gpu_guest(gpu);
+    memory_census_buffer(guest, size);   // (IC1)
     std::lock_guard lk(pools_mu);
     Pool* p = pool_of(guest, size);
     if (!p) return {};
@@ -4916,6 +4930,46 @@ void note_direct_write(Pool& p, uint64_t off, uint64_t size) {   // (pools_mu he
         wb_pages_note(p.lo + off, p.lo + std::min(off + size, p.hi - p.lo), mem_rec_value, 0);
 }
 
+// (2026-11-26, IC1) RX_VK_IMPORT_CENSUS (on; =0 off): what the imports hold, in 64 KB blocks of guest memory: those ever bound
+// as a buffer (gpu_buffer_bind, gpu_buffer: the fast paths too) and those ever read as a texture's source (texture uploads).
+// The imports are GPU-held, so the cold store can move none of their pages to the SSD (51.log: 3101 MB imported, 94 % of the
+// chunks it looked at refused). The census says how much of them no buffer binding ever needed: what importing only the bound
+// ranges would let it take. Two bitmaps of the 1 TB below the virtual pools, 2 MB each, made at the first mark
+namespace import_census {
+constexpr unsigned kShift = 16;
+constexpr uint64_t kBlocks = (1ull << 40) >> kShift;
+std::atomic<uint64_t>* buf_bits = nullptr;
+std::atomic<uint64_t>* tex_bits = nullptr;
+std::once_flag made;
+bool on() {
+    static const bool v = !getenv("RX_VK_IMPORT_CENSUS") || atoi(getenv("RX_VK_IMPORT_CENSUS")) != 0;
+    return v;
+}
+bool ready() {
+    std::call_once(made, [] {
+        buf_bits = (std::atomic<uint64_t>*)calloc(kBlocks / 64, sizeof(uint64_t));
+        tex_bits = (std::atomic<uint64_t>*)calloc(kBlocks / 64, sizeof(uint64_t));
+    });
+    return buf_bits && tex_bits;
+}
+inline void mark(std::atomic<uint64_t>* bits, uint64_t guest, uint64_t size) {
+    if (!size || guest >= (1ull << 40)) return;
+    const uint64_t b0 = guest >> kShift, b1 = std::min((guest + size - 1) >> kShift, kBlocks - 1);
+    for (uint64_t b = b0; b <= b1; b++) {
+        std::atomic<uint64_t>& w = bits[b >> 6];
+        const uint64_t m = 1ull << (b & 63);
+        if (!(w.load(std::memory_order_relaxed) & m)) w.fetch_or(m, std::memory_order_relaxed);
+    }
+}
+inline bool test(const std::atomic<uint64_t>* bits, uint64_t b) { return (bits[b >> 6].load(std::memory_order_relaxed) >> (b & 63)) & 1; }
+}   // namespace import_census
+void memory_census_buffer(uint64_t guest, uint64_t size) {
+    if (import_census::on() && import_census::ready()) import_census::mark(import_census::buf_bits, guest, size);
+}
+void memory_census_texture(uint64_t guest, uint64_t size) {
+    if (import_census::on() && import_census::ready()) import_census::mark(import_census::tex_bits, guest, size);
+}
+
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (written) texture_gpu_wrote(gpu, size);
     // (below 1 TB a GPU address is the guest address itself, and a pool holds the whole range or nothing: the host's
@@ -4926,6 +4980,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};
         guest = host->gpu_guest(gpu);
     }
+    memory_census_buffer(guest, size);   // (IC1)
     // (the same read, while that stamp still stands: the buffer and the offset are the ones found before. a miss
     // runs the lookup below, including a mirror sync, and remembers what it returned. a write is not remembered)
     auto remember = [&](BufferRef ref) {
@@ -5185,6 +5240,23 @@ void retired_imports_give_back() {   // (pools_mu held)
         logf("vk: imports: %zu live (%llu MB), %zu retired still imported (%llu MB), %llu retired given back (%llu MB)",
              imported.size(), (unsigned long long)(live_bytes >> 20), retired_alive, (unsigned long long)(retired_bytes >> 20),
              (unsigned long long)st_retired_imports_freed, (unsigned long long)(st_retired_import_bytes_freed >> 20));
+        if (import_census::on() && import_census::buf_bits && import_census::tex_bits) {   // (IC1)
+            uint64_t buf = 0, tex_only = 0, neither = 0, pools_no_buf = 0, bytes_no_buf = 0;
+            for (auto& [lo2, p] : imported) {
+                uint64_t pb = 0;
+                for (uint64_t b = p.lo >> import_census::kShift; b < ((p.hi + 0xffff) >> import_census::kShift) && b < import_census::kBlocks; b++) {
+                    if (import_census::test(import_census::buf_bits, b)) buf++, pb++;
+                    else if (import_census::test(import_census::tex_bits, b)) tex_only++;
+                    else neither++;
+                }
+                if (!pb) pools_no_buf++, bytes_no_buf += p.hi - p.lo;
+            }
+            const uint64_t blk = 1ull << import_census::kShift;
+            logf("vk: import census: of the %llu MB imported, %llu MB ever bound as buffers, %llu MB only read as textures' sources, "
+                 "%llu MB neither; %llu imports (%llu MB) with no buffer binding at all (RX_VK_IMPORT_CENSUS=0: off)",
+                 (unsigned long long)(live_bytes >> 20), (unsigned long long)((buf * blk) >> 20), (unsigned long long)((tex_only * blk) >> 20),
+                 (unsigned long long)((neither * blk) >> 20), (unsigned long long)pools_no_buf, (unsigned long long)(bytes_no_buf >> 20));
+        }
     }
 }
 void mirror_free(Pool& p) {

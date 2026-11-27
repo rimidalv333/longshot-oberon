@@ -79,6 +79,8 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
 void dry_mark_written(NvnState& s, bool compute, bool first);   // (longshot: the parallel replay's dry pass)
 void dry_marks_begin();   // (at the start of each dry pass: the last targets it skipped by are forgotten)
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipelines);
+void pipeline_sweep();   // (PR1: the new area's sweep, on the replay thread; vk_draw.cpp)
+void pipeline_area_present();   // (PR1: each present, from vk_replay.cpp log_frame_stats; vk_draw.cpp)
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms);
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms);
 /// (longshot) pipelines linked from stage libraries in the draw, and the libraries asked of the driver for them: had, and cold;

@@ -194,7 +194,23 @@ static inline uint64_t marks_from(uint64_t p, uint64_t p1) {
     return (marks_set64(&a64_dirty[w]) >> (p - w)) & ((1ull << (p1 - p)) - 1);
 }
 #endif
-static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
+/* (2026-11-26, HK2) RX_VK_HEAP_KEEP2 (on; =0 off): the page list a collection hands the renderer is a buffer the calling
+   thread keeps, one for each kind of collection, not a new 16 KB (and more, doubled) block every call that the renderer frees
+   at once: 49.log's heap churn, ~1.7 GB a run. The renderer frees it on the thread that collected (memory_collect_written,
+   capture_make), so host_free_pages leaves a kept one alone */
+static int heap_keep2(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RX_VK_HEAP_KEEP2");
+        v = !e || atoi(e) != 0;   /* (on since 50.log; =0 off) */
+    }
+    return v;
+}
+static __thread uint32_t *kept_pages[2];
+static __thread size_t kept_cap[2];
+static int64_t collect_in_slot(const uint64_t (*ranges)[2], int nranges, uint32_t **pages, int slot);
+static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) { return collect_in_slot(ranges, nranges, pages, 1); }
+static int64_t collect_in_slot(const uint64_t (*ranges)[2], int nranges, uint32_t **pages, int slot) {
     /* (HOS_COLLECT_WIDE=0: 32 marks a step at most, as before; the pages found are the same either way) */
     static int wide = -1;
     if (wide < 0) {
@@ -215,7 +231,10 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
     }
 #endif
     size_t n = 0, cap = 4096;
-    uint32_t *out = malloc(cap * sizeof *out);
+    const int keep = heap_keep2();
+    uint32_t *out = keep && kept_pages[slot] ? kept_pages[slot] : NULL;
+    if (out) cap = kept_cap[slot];
+    else out = malloc(cap * sizeof *out);
     for (int r = 0; r < nranges; r++) {
         const uint64_t lo = ranges[r][0], hi = ranges[r][1] < hos_guest_size() ? ranges[r][1] : hos_guest_size();
         uint64_t p1 = (hi + 4095) >> 12;
@@ -277,13 +296,20 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
 #endif
         }
     }
+    if (keep) {   /* (HK2: kept for the thread's next collection of this kind; a list past 4 MB not kept) */
+        if (cap * sizeof *out > (4u << 20)) {
+            if (kept_pages[slot] == out) kept_pages[slot] = NULL, kept_cap[slot] = 0;
+        } else {
+            kept_pages[slot] = out, kept_cap[slot] = cap;
+        }
+    }
     *pages = out;
     return (int64_t)n;
 }
 static int64_t host_collect(uint32_t **pages) {
     static uint64_t (*ranges)[2];
     if (!ranges) ranges = malloc(sizeof *ranges * 4096);
-    return collect_in(ranges, hos_gpu_guest_ranges(ranges, 4096), pages);
+    return collect_in_slot(ranges, hos_gpu_guest_ranges(ranges, 4096), pages, 0);
 }
 /* (only within the given guest ranges: the submit-time capture of the mirrored pools, a small part of the 20 ms the
    whole collection takes) */
@@ -296,7 +322,12 @@ static int64_t host_collect(uint32_t **pages) {
 }
 static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { (void)ranges, (void)n; *pages = 0; return 0; }
 #endif
-static void host_free_pages(uint32_t *pages) { free(pages); }
+static void host_free_pages(uint32_t *pages) {
+#if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
+    if (pages && (pages == kept_pages[0] || pages == kept_pages[1])) return;   /* (HK2: the thread's kept list) */
+#endif
+    free(pages);
+}
 static void host_mark_written(const void *p, uint64_t n) {
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
     hos_mark_written(p, (size_t)n);

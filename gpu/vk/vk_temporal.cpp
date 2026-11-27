@@ -617,6 +617,17 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     } timed{s};
     std::vector<State::Skin> skins = std::move(s.skins);
     s.skins.clear();
+    // (2026-11-26, HK2, RX_VK_HEAP_KEEP2=1) the frame's list given back to s.skins once done with it (s.mu held, by
+    // temporal_upscale, from here to then), so the next frame's draws fill the room it has: not a list grown again from nothing
+    // by doubling, to ~260 KB, every frame (49.log: ~1.1 GB a run made and freed)
+    struct GiveBack {
+        State& s;
+        std::vector<State::Skin>& v;
+        ~GiveBack() {
+            static const bool keep = [] { const char* e = getenv("RX_VK_HEAP_KEEP2"); return !e || atoi(e) != 0; }();   // (on since 50.log)
+            if (keep && s.skins.empty() && s.skins.capacity() < v.capacity()) v.clear(), s.skins.swap(v);
+        }
+    } give_back{s, skins};
     std::unordered_map<uint64_t, State::Pose> old = std::move(s.poses);
     s.poses.clear();
     static const bool off = env_switch("RX_VK_DLSS_ACTORS") == 0;
