@@ -85,6 +85,10 @@ export PATH="$deps/llvm/bin:$deps/python/bin:$PATH"
 export PS5_CLANG="$deps/llvm/bin/clang" LLVM_CONFIG="$deps/llvm/bin/llvm-config"
 export PS5_PAYLOAD_SDK="$deps/ps5-payload-sdk" PS5_VULKAN="$deps/PS5_Vulkan" PS5_MIHAWKGEN="$deps/PS5_MihawkGen"
 export PS5_DEPS="$deps" LONGSHOT_VERSION="oberon-$VERSION"
+# (2026-11-27) The settings this release is built and tested with, as build.cmd sets them: the lifted code's floats as host
+# floats (nx2/fp_native.py) and the game's hot code built with the shipped profile. Set either one outside to change it; set it
+# empty (RX_FP_NATIVE= PS5_PGO=) for a build without it
+export RX_FP_NATIVE="${RX_FP_NATIVE-1}" PS5_PGO="${PS5_PGO-$root/ps5/profiles/vk.profdata}"
 unset PYTHONPATH PYTHONHOME
 python="$deps/python/bin/python3"
 "$python" -c 'import capstone, unicorn, numpy, zstandard, lz4' 2> /dev/null || die "the bundled Python in deps/python does not run"

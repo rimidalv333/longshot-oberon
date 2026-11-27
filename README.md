@@ -183,6 +183,16 @@ uncapped so the headroom shows; with the 30 lock on, any window at 30 fps or abo
 The result is `dist/PPSA93339`. Everything in it that was made from your game (`eboot.bin`, `image.bin`,
 `longshot_shaders.bin`, `prompts/`) is yours alone: don't share it.
 
+### Build on Windows (no WSL)
+
+The same release zip builds on plain Windows: its `deps\windows\` folder carries LLVM 18.1.8, Python 3.12 and the build's
+helpers for Windows, so nothing is installed. Unzip `release.zip` anywhere (a short path such as `C:\longshot` is best),
+copy `oot.nup` into the `longshot_oberon` folder, beside `build.cmd`, and double-click `build.cmd`. About an hour the
+first time. The title folder is `longshot_oberon\dist\PPSA93339`; the window and `build.log` end with where to put it and
+`eboot.bin`'s sha256. Options (`--jobs 3`, `--out DIR`) go in a one-line `build_args.txt` beside `build.cmd`, or after
+the game file on a command line (`build.cmd D:\Games\oot.nup --jobs 3`). An interrupted build continues where it stopped
+when you run it again. From the same zip and game file, `build.cmd` and `build.sh` make the same `eboot.bin`.
+
 ### Put it on the console
 
 1. Copy the whole `PPSA93339` folder to `/data/homebrew/PPSA93339`.

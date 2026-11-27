@@ -12,3 +12,5 @@ __pycache__/
 *.pyc
 *.o
 *.log
+/build.status
+/build_args.txt
