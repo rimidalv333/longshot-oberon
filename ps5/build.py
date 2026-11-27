@@ -492,7 +492,10 @@ def main():
         title_id = json.load(open(os.path.join(ROOT, "ps5", "sce_sys", "param.json")))["titleId"]
         os.makedirs(os.path.join(ROOT, "dist", title_id, "framegen"), exist_ok=True)
         shutil.copy(MIHAWKGEN_NETWORK, os.path.join(ROOT, "dist", title_id, "framegen", "network.fgw"))
-        rev = subprocess.run(["git", "-C", MIHAWKGEN, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+        try:   # (2026-11-27: git is not needed to build: on a PC without it the revision is just not named)
+            rev = subprocess.run(["git", "-C", MIHAWKGEN, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+        except OSError:
+            rev = ""
         print("ps5: frame generation by PS5_MihawkGen (%s)" % (rev or "no revision"), flush=True)
     return linked
 
